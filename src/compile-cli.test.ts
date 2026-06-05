@@ -68,7 +68,7 @@ describe('compileCli', () => {
     expect(argv).toEqual(['-c', 'top', '-l', 'top', '--font', '14']);
   });
 
-  it('flags JSON-only fields as lossy (bounds, active, subtitle, meta, command-less pane)', () => {
+  it('flags JSON-only fields as lossy (bounds, active, subtitle, meta, args, command-less pane)', () => {
     const { lossy, lossless } = compileCli({
       windows: [
         {
@@ -78,6 +78,7 @@ describe('compileCli', () => {
             {
               panes: [
                 { command: 'a', subtitle: 'feature/x', meta: { role: 'worker' } },
+                { command: 'claude', args: ['--append-system-prompt', 'be a pirate'] },
                 { label: 'placeholder' }
               ]
             }
@@ -92,6 +93,7 @@ describe('compileCli', () => {
         'window active-tab index',
         'pane subtitle',
         'pane metadata',
+        'pane args (direct-spawn argv)',
         'pane without a command'
       ])
     );

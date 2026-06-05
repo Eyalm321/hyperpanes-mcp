@@ -47,6 +47,10 @@ export const PaneSpecSchema = z
     subtitle: z.string().optional(),
     color: z.string().optional(),
     command: z.string().optional(),
+    // Literal argv for a DIRECT (no-shell) spawn of `command` — passed verbatim to
+    // the pty, so values with spaces/quotes survive intact (interactive-pane-driving
+    // plan P4a). JSON-only: the CLI grammar has no flag for it (see compile-cli).
+    args: z.array(z.string()).optional(),
     cwd: z.string().optional(),
     shell: z.string().optional(),
     fontSize: z.number().int().positive().optional(),

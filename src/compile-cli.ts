@@ -10,6 +10,7 @@ import { windowsOf, type WorkspaceFile, type WindowSpec, type PaneSpec } from '.
  *   - window/tab `active` index  (no `--active` flag in the shipped parser)
  *   - pane `subtitle`            (no `--subtitle` flag)
  *   - pane `meta`                (org metadata — no flag)
+ *   - pane `args`                (direct-spawn argv — no flag; shell-wraps instead)
  *   - a pane with no `command`   (CLI panes only exist via `-c`)
  *   - tab `sizes`/`mainFraction` (split ratios — no flag)
  *   - tab `focused`/`zoomed`     (focused / maximized pane index — no flag)
@@ -47,6 +48,9 @@ function collectLossy(windows: WindowSpec[]): string[] {
       for (const p of g.panes) {
         if (p.subtitle) lossy.add('pane subtitle');
         if (p.meta && Object.keys(p.meta).length) lossy.add('pane metadata');
+        // A direct-spawn argv can't be expressed as flags — a CLI launch would
+        // shell-wrap `command` (re-parsing it), losing the verbatim-argv semantics.
+        if (p.args && p.args.length) lossy.add('pane args (direct-spawn argv)');
         if (!p.command) lossy.add('pane without a command');
       }
     }

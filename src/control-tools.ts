@@ -116,6 +116,8 @@ export function registerControlTools(server: McpServer): void {
             activity: pane.activity,
             exitCode: pane.exitCode,
             command: pane.command,
+            // Direct-spawn argv (P4a), omitted when the pane uses the shell path.
+            ...(pane.args && pane.args.length ? { args: pane.args } : {}),
             cwd: pane.cwd,
             shell: pane.shell,
             color: pane.color,
@@ -184,9 +186,15 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Open pane',
       description:
-        'Open a new pane in the active tab of a window (defaults to the first window). Returns the new paneId. `meta` attaches free-form org metadata (reserved keys: role/parent/agentType/task) so the new worker is self-describing.',
+        'Open a new pane in the active tab of a window (defaults to the first window). Returns the new paneId. `command` alone runs through the shell. Pass `args` (a string array) to run `command` DIRECTLY as the executable with that exact argv — no shell, no re-parse — which is the reliable way to pass arguments containing spaces or quotes (e.g. command:"claude", args:["--append-system-prompt","…long persona…"]); a single `command` string with such args gets mangled by the shell. `meta` attaches free-form org metadata (reserved keys: role/parent/agentType/task) so the new worker is self-describing.',
       inputSchema: {
         command: z.string().optional(),
+        args: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'With `command`: run it directly with this verbatim argv (no shell re-parse). Each element is one argument — do NOT pre-quote.'
+          ),
         label: z.string().optional(),
         cwd: z.string().optional(),
         shell: z.string().optional(),
@@ -200,7 +208,7 @@ export function registerControlTools(server: McpServer): void {
         windowId: z.number().int().optional()
       }
     },
-    async ({ command, label, cwd, shell, color, meta, env, windowId }) =>
+    async ({ command, args, label, cwd, shell, color, meta, env, windowId }) =>
       run(async (c) => {
         const state = await c.state();
         const target = windowId ?? firstWindowId(state);
@@ -208,7 +216,7 @@ export function registerControlTools(server: McpServer): void {
         const res = await c.command({
           type: 'newPane',
           windowId: target,
-          pane: { label, command, cwd, shell, color, meta, env }
+          pane: { label, command, args, cwd, shell, color, meta, env }
         });
         // The app returns the new pane id via the command round-trip (D). A
         // missing id means the round-trip failed (a timed-out/wedged renderer now

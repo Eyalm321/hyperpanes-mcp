@@ -45,7 +45,7 @@ It works at two levels, and you can use either without the other:
 
 | Tool | Description |
 |---|---|
-| `open_pane` | Open a new pane in a window's active tab (defaults to the first window). Returns the new `paneId`; accepts `meta` (org metadata) and `env` (e.g. a scoped token) at spawn. |
+| `open_pane` | Open a new pane in a window's active tab (defaults to the first window). Returns the new `paneId`; accepts `meta` (org metadata) and `env` (e.g. a scoped token) at spawn. Pass `args` (a string array) to run `command` **directly** with that verbatim argv — no shell, no re-parse — the reliable way to pass arguments containing spaces/quotes (e.g. `command:"claude", args:["--append-system-prompt","…persona…"]`). |
 | `set_layout` | Set a tab's tiling layout (defaults to the first window's active tab). |
 | `focus_pane` | Focus a pane (and its tab/window). |
 | `close_pane` | Close a pane, terminating its shell. |

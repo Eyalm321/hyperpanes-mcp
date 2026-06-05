@@ -11,6 +11,7 @@ export interface ControlPane {
   subtitle?: string; // secondary header line; set by rename_pane, omitted when unset
   color: string;
   command?: string;
+  args?: string[]; // direct-spawn argv, if this pane was opened with one (P4a)
   cwd?: string;
   shell?: string;
   status: 'running' | 'exited';

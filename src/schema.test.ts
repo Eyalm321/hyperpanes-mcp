@@ -112,6 +112,22 @@ describe('validateWorkspace', () => {
     expect(validateWorkspace({ panes: [{ command: 'x', fontSize: 12.5 }] }).valid).toBe(false);
   });
 
+  it('accepts a pane args array for a direct (no-shell) spawn (P4a)', () => {
+    const input = {
+      panes: [{ command: 'claude', args: ['--append-system-prompt', 'be a pirate, matey'] }]
+    };
+    expect(validateWorkspace(input).valid).toBe(true);
+    // args round-trips verbatim (each element is one argument, no quoting applied).
+    expect(WorkspaceFileSchema.parse(input).panes?.[0]?.args).toEqual([
+      '--append-system-prompt',
+      'be a pirate, matey'
+    ]);
+  });
+
+  it('rejects a non-string entry in pane args (typo guard)', () => {
+    expect(validateWorkspace({ panes: [{ command: 'x', args: ['--flag', 7] }] }).valid).toBe(false);
+  });
+
   it('accepts free-form pane meta (agent-orchestration C)', () => {
     const r = validateWorkspace({
       panes: [{ command: 'claude', meta: { role: 'worker', parent: 'p0', task: 'tests' } }]
