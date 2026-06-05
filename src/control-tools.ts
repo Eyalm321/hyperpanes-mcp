@@ -138,15 +138,44 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Read pane output',
       description:
-        'Read a pane\'s terminal output (scrollback). `tail` limits to the last N lines. `strip` removes ANSI escape codes for a clean plain-text view (agent-orchestration G) — easier to parse a worker\'s TUI. For continuous streaming, subscribe to the pane\'s output resource instead.',
+        'Read a pane\'s terminal output. `mode:"screen"` returns the RENDERED cell grid (what\'s actually on screen — no overdraw, spinner spam, or mangled spacing) instead of the raw pty stream; use it to read a TUI agent\'s transcript cleanly (default "raw"). `tail` limits to the last N lines; `strip` removes ANSI escape codes from a raw read. `waitForIdle` BLOCKS until the pane has been output-quiet for `settleMs` (default 600ms) or `timeoutMs` (default 30000ms) elapses — the way to read a reply without polling/sleeping. `since` is a byte cursor (use the `cursor` from a prior read) that returns only NEW output (raw mode), so you don\'t re-scrape the whole scrollback each turn. Every read returns the current `cursor`. For continuous streaming, subscribe to the pane\'s output resource instead.',
       inputSchema: {
         paneId: z.string(),
+        mode: z
+          .enum(['raw', 'screen'])
+          .optional()
+          .describe('"screen" = rendered cell grid (clean TUI transcript); "raw" (default) = pty byte stream'),
         tail: z.number().int().positive().optional(),
-        strip: z.boolean().optional()
+        strip: z.boolean().optional(),
+        since: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe('byte cursor from a prior read\'s `cursor`; returns only output produced since'),
+        waitForIdle: z
+          .boolean()
+          .optional()
+          .describe('block until the pane is output-quiet for settleMs (or timeoutMs)'),
+        settleMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('quiet window that ends a waitForIdle read (default 600ms; raise for slow models)'),
+        timeoutMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('max time to block on waitForIdle before returning what is there (default 30000ms)')
       }
     },
-    async ({ paneId, tail, strip }) =>
-      run(async (c) => ({ ok: true, ...(await c.readPane(paneId, tail, strip)) }))
+    async ({ paneId, mode, tail, strip, since, waitForIdle, settleMs, timeoutMs }) =>
+      run(async (c) => ({
+        ok: true,
+        ...(await c.readPane(paneId, { mode, tail, strip, since, waitForIdle, settleMs, timeoutMs }))
+      }))
   );
 
   // ---- open_pane -------------------------------------------------------
@@ -187,7 +216,12 @@ export function registerControlTools(server: McpServer): void {
         // too) — surface it as an error rather than a phantom success (#2).
         const paneId = typeof res.result === 'string' ? res.result : undefined;
         if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
-        return { ok: true, windowId: target, paneId };
+        // Wait for the pane to land in the read-model so an immediate read_pane /
+        // prompt_pane doesn't 404 — the structure publish is debounced (see
+        // waitForPane). `ready:false` means it didn't appear in time (rare); the
+        // pane still exists, the read-model just lagged unusually.
+        const ready = await c.waitForPane(paneId);
+        return { ok: true, windowId: target, paneId, ready };
       })
   );
 
@@ -306,10 +340,20 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Send input to a pane',
       description:
-        'Type text into a live shell (append "\\n"/"\\r" to submit). DANGEROUS: this executes whatever you send in a real terminal. Triple-gated and never on by default — requires (1) the app\'s "Allow agent control → input" toggle, (2) HYPERPANES_ALLOW_INPUT=1 on this bridge, and (3) confirm=true on every call. See README "send_input safety model".',
+        'Type text into a live shell. With `submit:true` the app writes your text, then a SEPARATE bare Enter a beat later — the reliable way to submit a line to a TUI agent (a trailing "\\n" in one write is read as a bracketed paste, not Enter). Without submit, include a trailing newline yourself to run a shell command. DANGEROUS: this executes whatever you send in a real terminal. Triple-gated and never on by default — requires (1) the app\'s "Allow agent control → input" toggle, (2) HYPERPANES_ALLOW_INPUT=1 on this bridge, and (3) confirm=true on every call. See README "send_input safety model".',
       inputSchema: {
         paneId: z.string(),
-        data: z.string().describe('Exact bytes to write; include a trailing newline to run a command.'),
+        data: z.string().describe('Exact bytes to write. With submit:true, pass the line WITHOUT a trailing newline.'),
+        submit: z
+          .boolean()
+          .optional()
+          .describe('Write a bare Enter as a separate keystroke after the text (submits a TUI line cleanly).'),
+        submitDelayMs: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe('Beat between the text and the Enter when submit:true (default ~40ms; raise for slow TUIs).'),
         confirm: z.boolean().optional().describe('Must be true — explicit per-call confirmation.'),
         owner: z
           .string()
@@ -317,15 +361,99 @@ export function registerControlTools(server: McpServer): void {
           .describe('Lock owner, if the pane was locked via lock_pane — required to write a locked pane.')
       }
     },
-    async ({ paneId, data, confirm, owner }) =>
+    async ({ paneId, data, submit, submitDelayMs, confirm, owner }) =>
       run(async (c) => {
         const state = await c.state();
         const found = flattenPanes(state).find((p) => p.pane.id === paneId);
         if (!found) throw new Error(`no such pane: ${paneId}`);
         const decision = checkInputAllowed(readInputGate(), { confirm }, found.pane);
         if (!decision.ok) return { ok: false, refused: true, reason: decision.reason };
-        await c.sendInput(paneId, data, owner);
-        return { ok: true, paneId, bytes: data.length };
+        await c.sendInput(paneId, data, owner, submit, submitDelayMs);
+        return { ok: true, paneId, bytes: data.length, submitted: submit === true };
+      })
+  );
+
+  // ---- send_keys (GUARDED — also input) --------------------------------
+  server.registerTool(
+    'send_keys',
+    {
+      title: 'Send named keys to a pane',
+      description:
+        'Send a sequence of named keys to a live pane as the right terminal bytes: enter, escape, tab, shift+tab, up/down/left/right, home/end, pageup/pagedown, backspace, delete, space, and ctrl+<letter> (e.g. ctrl+c). For menus, y/n and trust prompts, and cancelling — things a text string can\'t express. Same triple gate as send_input (it IS input): app toggle + HYPERPANES_ALLOW_INPUT=1 + confirm=true.',
+      inputSchema: {
+        paneId: z.string(),
+        keys: z.array(z.string()).describe('Ordered key names, e.g. ["enter"] or ["ctrl+c"] or ["down","down","enter"].'),
+        confirm: z.boolean().optional().describe('Must be true — explicit per-call confirmation.'),
+        owner: z.string().optional().describe('Lock owner, if the pane was locked via lock_pane.')
+      }
+    },
+    async ({ paneId, keys, confirm, owner }) =>
+      run(async (c) => {
+        const state = await c.state();
+        const found = flattenPanes(state).find((p) => p.pane.id === paneId);
+        if (!found) throw new Error(`no such pane: ${paneId}`);
+        const decision = checkInputAllowed(readInputGate(), { confirm }, found.pane);
+        if (!decision.ok) return { ok: false, refused: true, reason: decision.reason };
+        await c.sendKeys(paneId, keys, owner);
+        return { ok: true, paneId, keys };
+      })
+  );
+
+  // ---- prompt_pane (GUARDED — the one-call TUI turn) -------------------
+  server.registerTool(
+    'prompt_pane',
+    {
+      title: 'Prompt a pane and read the reply',
+      description:
+        'Drive one full turn of a TUI agent (e.g. a live `claude`) in a pane with ONE call: type `text`, submit it cleanly (a separate Enter), wait for the pane to go output-quiet, then return the RENDERED screen transcript and whether it is now awaiting input. The wait is turn-aware — it won\'t return on the pre-prompt screen, only once the reply has begun and settled. Composes send_input(submit) + read_pane(waitForIdle, mode:"screen"). Same triple gate as send_input (it IS input): app toggle + HYPERPANES_ALLOW_INPUT=1 + confirm=true.',
+      inputSchema: {
+        paneId: z.string(),
+        text: z.string().describe('The message to type. No trailing newline needed — it is submitted for you.'),
+        confirm: z.boolean().optional().describe('Must be true — explicit per-call confirmation.'),
+        owner: z.string().optional().describe('Lock owner, if the pane was locked via lock_pane.'),
+        settleMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Quiet window that ends the wait (default 600ms; raise for slow models).'),
+        timeoutMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Max time to wait for the reply (default 30000ms).'),
+        tail: z.number().int().positive().optional().describe('Limit the returned transcript to its last N lines.')
+      }
+    },
+    async ({ paneId, text, confirm, owner, settleMs, timeoutMs, tail }) =>
+      run(async (c) => {
+        const state = await c.state();
+        const found = flattenPanes(state).find((p) => p.pane.id === paneId);
+        if (!found) throw new Error(`no such pane: ${paneId}`);
+        const decision = checkInputAllowed(readInputGate(), { confirm }, found.pane);
+        if (!decision.ok) return { ok: false, refused: true, reason: decision.reason };
+        // Snapshot the byte cursor BEFORE sending so the wait is turn-aware: it
+        // won't settle until output advances past here (the reply has begun).
+        const before = await c.readPane(paneId);
+        await c.sendInput(paneId, text, owner, true);
+        const reply = await c.readPane(paneId, {
+          since: before.cursor,
+          waitForIdle: true,
+          settleMs,
+          timeoutMs,
+          mode: 'screen',
+          tail
+        });
+        return {
+          ok: true,
+          paneId,
+          settled: reply.settled ?? false,
+          timedOut: reply.timedOut ?? false,
+          awaitingInput: reply.awaitingInput ?? false,
+          cursor: reply.cursor,
+          reply: reply.output
+        };
       })
   );
 

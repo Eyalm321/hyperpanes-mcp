@@ -14,6 +14,32 @@ export interface PaneOutput {
   status: 'running' | 'exited';
   output: string;
   stripped?: boolean;
+  // Byte cursor for delta reads (interactive-pane-driving plan B2): pass it back
+  // as `since` on the next read to get only newer output. Always present.
+  cursor?: number;
+  since?: number;
+  truncated?: boolean; // the `since` cursor fell off the back of the replay buffer
+  // Present only on a waitForIdle read (B1): whether the pane went quiet (settled)
+  // within the window or the wait timed out.
+  waited?: boolean;
+  settled?: boolean;
+  timedOut?: boolean;
+  // Rendered-screen reads (C1/C2): the mode served, and the blocked-prompt heuristic.
+  mode?: 'raw' | 'screen';
+  awaitingInput?: boolean;
+}
+
+// Read options for `read_pane`. `waitForIdle`/settleMs/timeoutMs make the read
+// block until the pane is output-quiet; `since` returns only newer output;
+// `mode:"screen"` returns the rendered cell grid instead of the raw pty stream.
+export interface ReadPaneOpts {
+  tail?: number;
+  strip?: boolean;
+  since?: number;
+  waitForIdle?: boolean;
+  settleMs?: number;
+  timeoutMs?: number;
+  mode?: 'raw' | 'screen';
 }
 
 export interface InboxRead {
@@ -78,10 +104,32 @@ export class ControlClient {
     return (await r.json()) as ControlState;
   }
 
-  async readPane(paneId: string, tail?: number, strip?: boolean): Promise<PaneOutput> {
+  // Poll /state until a pane id is present in the read-model, or timeout. The
+  // app's structure publish is DEBOUNCED, so a freshly-opened pane is briefly
+  // absent from /state even though open_pane's command round-trip already
+  // returned its id — a read/input in that gap 404s "no such pane". open_pane
+  // awaits this so its contract is "when it returns, the pane is drivable".
+  async waitForPane(paneId: string, timeoutMs = 3000): Promise<boolean> {
+    const start = Date.now();
+    for (;;) {
+      const present = (await this.state()).windows.some((w) =>
+        w.tabs.some((t) => t.panes.some((p) => p.id === paneId))
+      );
+      if (present) return true;
+      if (Date.now() - start >= timeoutMs) return false;
+      await new Promise((r) => setTimeout(r, 75));
+    }
+  }
+
+  async readPane(paneId: string, opts: ReadPaneOpts = {}): Promise<PaneOutput> {
     const params = new URLSearchParams();
-    if (tail && tail > 0) params.set('tail', String(Math.floor(tail)));
-    if (strip) params.set('strip', '1');
+    if (opts.tail && opts.tail > 0) params.set('tail', String(Math.floor(opts.tail)));
+    if (opts.strip) params.set('strip', '1');
+    if (opts.since !== undefined && opts.since >= 0) params.set('since', String(Math.floor(opts.since)));
+    if (opts.waitForIdle) params.set('waitForIdle', '1');
+    if (opts.settleMs && opts.settleMs > 0) params.set('settleMs', String(Math.floor(opts.settleMs)));
+    if (opts.timeoutMs && opts.timeoutMs > 0) params.set('timeoutMs', String(Math.floor(opts.timeoutMs)));
+    if (opts.mode) params.set('mode', opts.mode);
     const q = params.toString();
     const r = await this.req(`/panes/${encodeURIComponent(paneId)}/output${q ? `?${q}` : ''}`);
     if (r.status === 404) throw new Error(`no such pane: ${paneId}`);
@@ -149,11 +197,15 @@ export class ControlClient {
     return (await r.json()) as { ok: boolean };
   }
 
-  async sendInput(paneId: string, data: string, owner?: string): Promise<void> {
+  // POST to a pane's input route with shared error mapping. Both `send_input`
+  // (text, optional submit) and `send_keys` (named keys) ride this one path —
+  // same triple gate (403), advisory lock (423), missing pane (404), bad request
+  // / unknown key (400). The body shape decides which the app does.
+  private async postInput(paneId: string, body: Record<string, unknown>): Promise<void> {
     const r = await this.req(`/panes/${encodeURIComponent(paneId)}/input`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ data, ...(owner ? { owner } : {}) })
+      body: JSON.stringify(body)
     });
     if (r.status === 403) {
       throw new Error(
@@ -167,7 +219,34 @@ export class ControlClient {
       );
     }
     if (r.status === 404) throw new Error(`no such pane: ${paneId}`);
+    if (r.status === 400) {
+      const b = (await r.json().catch(() => ({}))) as { unknown?: string[]; error?: string };
+      throw new Error(
+        b.unknown?.length ? `unknown key(s): ${b.unknown.join(', ')}` : (b.error ?? 'bad input request')
+      );
+    }
     if (!r.ok) throw new Error(`input -> ${r.status}`);
+  }
+
+  async sendInput(
+    paneId: string,
+    data: string,
+    owner?: string,
+    submit?: boolean,
+    submitDelayMs?: number
+  ): Promise<void> {
+    await this.postInput(paneId, {
+      data,
+      ...(owner ? { owner } : {}),
+      ...(submit ? { submit: true } : {}),
+      ...(submitDelayMs !== undefined ? { submitDelayMs } : {})
+    });
+  }
+
+  // Send a sequence of named keys (enter/escape/tab/arrows/ctrl+c…) as VT bytes
+  // (interactive-pane-driving plan A2). Same gate as sendInput — it IS input.
+  async sendKeys(paneId: string, keys: string[], owner?: string): Promise<void> {
+    await this.postInput(paneId, { keys, ...(owner ? { owner } : {}) });
   }
 
   async command(cmd: ControlCommand): Promise<{ ok: boolean; result?: unknown }> {

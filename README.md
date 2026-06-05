@@ -37,7 +37,7 @@ It works at two levels, and you can use either without the other:
 |---|---|
 | `control_status` | Is the control API reachable? Reports app pid/version, whether the app allows input, the bridge-side `send_input` gate, and the `control.json` path. **Call this first.** |
 | `list_panes` | All panes across windows/tabs, with status, activity (busy/idle/exited), org metadata, tab/window context, and each pane's output-resource URI. |
-| `read_pane` | A pane's terminal scrollback. `tail` = last N lines; `strip` = ANSI-stripped clean text. |
+| `read_pane` | A pane's terminal output. `mode:"screen"` = the **rendered cell grid** (clean TUI transcript, no overdraw/spinner spam); `tail` = last N lines; `strip` = ANSI-stripped raw text; `waitForIdle` = **block until the pane goes output-quiet** (`settleMs`/`timeoutMs`) so you read a reply without polling; `since` = a byte cursor for **delta reads** (only new output). Every read returns the current `cursor`. |
 | `read_messages` | Drain a pane's durable message inbox past a cursor (`after` = highest seq seen). |
 | `whoami` | Identify the pane this bridge is running inside (`HYPERPANES_PANE_ID`) and its org metadata — so a manager-agent-in-a-pane can learn who it is before driving sub-workers. |
 
@@ -56,9 +56,29 @@ It works at two levels, and you can use either without the other:
 
 ### Send input
 
+All three **type into a live shell** — they run whatever you send in a real terminal. Triple-gated
+and never on by default. See the [safety model](#send_input-safety-model).
+
 | Tool | Description |
 |---|---|
-| `send_input` ⚠️ | **Type into a live shell** — runs whatever you send in a real terminal. Triple-gated and never on by default. See the [safety model](#send_input-safety-model). |
+| `send_input` ⚠️ | Type text. `submit:true` writes your text, then a **separate** Enter a beat later — the reliable way to submit a TUI line (a trailing `\n` in one write is read as a bracketed paste, not Enter). |
+| `send_keys` ⚠️ | Send **named keys** as the right terminal bytes: `enter`, `escape`, `tab`, `shift+tab`, arrows, `home`/`end`, `pageup`/`pagedown`, `backspace`, `delete`, `space`, `ctrl+<letter>`. For menus, y/n & trust prompts, and cancelling. |
+| `prompt_pane` ⚠️ | **One full turn in one call**: type → submit → wait for the pane to settle → return the rendered transcript + whether it's now `awaitingInput`. The way to converse with a TUI agent in a pane. |
+
+### Driving an interactive TUI agent
+
+Two supported patterns for talking to an agent running **inside** a pane (e.g. a live `claude`):
+
+- **Structured bus (preferred when the agent is MCP-capable).** If the pane-agent also has the
+  hyperpanes MCP, converse over its **inbox** (`send_message` / `send_to_parent` / `read_messages`)
+  — a clean, structured channel, no screen-scraping. Run such workers with an inbox-poll loop
+  ("listening agent") so they pick messages up unprompted.
+- **TUI scrape (for any agent, incl. an interactive `claude` that won't poll its inbox).** Drive
+  the terminal directly. The one-call path is **`prompt_pane`**; under the hood that's
+  `send_input({ submit:true })` to type a line, `read_pane({ waitForIdle:true })` to block until the
+  reply lands, and `read_pane({ mode:"screen" })` to read it back cleanly. Use `send_keys(["enter"])`
+  to clear a first-run **trust dialog**, and watch `awaitingInput` on the result to know when the
+  agent is blocked on a prompt rather than done.
 
 ### Agent orchestration
 
