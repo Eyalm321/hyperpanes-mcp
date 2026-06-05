@@ -59,7 +59,7 @@ export const PaneSpecSchema = z
     // and DROP non-string values, keeping the canonical string→string shape rather
     // than failing validation on a workspace the app would happily load.
     meta: z
-      .record(z.unknown())
+      .record(z.string(), z.unknown())
       .transform((m) => {
         const out: Record<string, string> = {};
         for (const [k, v] of Object.entries(m)) if (typeof v === 'string') out[k] = v;

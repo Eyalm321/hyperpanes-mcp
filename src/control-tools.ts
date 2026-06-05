@@ -160,12 +160,12 @@ export function registerControlTools(server: McpServer): void {
         cwd: z.string().optional(),
         shell: z.string().optional(),
         color: z.string().optional(),
-        meta: z.record(z.string()).optional(),
+        meta: z.record(z.string(), z.string()).optional(),
         // Extra pty env (agent-orchestration F). To staff a subtree-scoped worker,
         // mint_token a scoped token and pass { HYPERPANES_CONTROL_TOKEN: <token>,
         // HYPERPANES_CONTROL_PORT: <port> } here — the child then reaches only its
         // subtree, and is NOT given the master control.json.
-        env: z.record(z.string()).optional(),
+        env: z.record(z.string(), z.string()).optional(),
         windowId: z.number().int().optional()
       }
     },
@@ -199,7 +199,7 @@ export function registerControlTools(server: McpServer): void {
       inputSchema: {
         paneId: z.string(),
         meta: z
-          .record(z.union([z.string(), z.null()]))
+          .record(z.string(), z.union([z.string(), z.null()]))
           .describe('key→string sets/overwrites it; key→null deletes it')
       }
     },
