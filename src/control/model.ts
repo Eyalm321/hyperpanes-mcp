@@ -8,6 +8,7 @@ export interface ControlPane {
   id: string;
   sessionUid: string;
   label: string;
+  subtitle?: string; // secondary header line; set by rename_pane, omitted when unset
   color: string;
   command?: string;
   cwd?: string;

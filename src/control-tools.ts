@@ -108,6 +108,8 @@ export function registerControlTools(server: McpServer): void {
           panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, layout, activeTab }) => ({
             paneId: pane.id,
             label: pane.label,
+            // Secondary header line, omitted when unset (set via rename_pane).
+            ...(pane.subtitle ? { subtitle: pane.subtitle } : {}),
             status: pane.status,
             // Liveness heuristic: 'idle' ≈ waiting at its prompt / done, 'busy' =
             // recently emitting output, 'exited' = gone. Not a "task complete" guarantee.
@@ -205,12 +207,14 @@ export function registerControlTools(server: McpServer): void {
     },
     async ({ paneId, meta }) =>
       run(async (c) => {
-        await c.command({ type: 'setMeta', paneId, meta });
-        // Echo the TRUE merged result (deletes applied, prior keys retained), not
-        // the raw patch — re-read /state so the caller sees exactly what stuck (#7).
-        const state = await c.state();
-        const found = flattenPanes(state).find((p) => p.pane.id === paneId);
-        return { ok: true, paneId, meta: found?.pane.meta ?? {} };
+        // The app echoes the TRUE merged meta (deletes applied, prior keys retained)
+        // as the command result, mirroring newPane → id. Use it directly instead of
+        // re-reading /state: that read races the renderer's debounced control-publish
+        // and returns a pre-merge snapshot, so just-set keys appear hundreds of ms
+        // late (the #7 echo race). This also drops an extra HTTP round-trip.
+        const res = await c.command({ type: 'setMeta', paneId, meta });
+        const merged = (res.result ?? {}) as Record<string, string>;
+        return { ok: true, paneId, meta: merged };
       })
   );
 
