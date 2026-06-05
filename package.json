@@ -1,0 +1,60 @@
+{
+  "name": "@eyalm321/hyperpanes-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for hyperpanes (Electron terminal-workspace app) — compose, validate, and launch workspace layouts, and drive a running instance (read/spawn/layout panes, stream output, guarded input)",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "hyperpanes-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "node --eval \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "hyperpanes",
+    "terminal",
+    "electron",
+    "workspace",
+    "panes"
+  ],
+  "author": "Eyalm321",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eyalm321/hyperpanes-mcp.git"
+  },
+  "homepage": "https://github.com/Eyalm321/hyperpanes-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Eyalm321/hyperpanes-mcp/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

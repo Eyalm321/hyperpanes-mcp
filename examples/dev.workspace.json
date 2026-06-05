@@ -1,0 +1,41 @@
+{
+  "name": "dev",
+  "windows": [
+    {
+      "title": "app",
+      "active": 0,
+      "bounds": { "width": 1280, "height": 800, "maximized": false },
+      "groups": [
+        {
+          "title": "run",
+          "layout": "main-stack",
+          "panes": [
+            { "command": "npm run dev", "label": "server", "color": "#e5484d", "cwd": "./app" },
+            { "command": "npm run test:watch", "label": "tests", "cwd": "./app" },
+            { "command": "tail -f logs/app.log", "label": "logs", "subtitle": "app.log" }
+          ]
+        },
+        {
+          "title": "scratch",
+          "layout": "columns",
+          "panes": [
+            { "command": "psql mydb", "label": "psql", "cwd": "./db" },
+            { "label": "shell" }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "monitoring",
+      "groups": [
+        {
+          "layout": "grid",
+          "panes": [
+            { "command": "htop", "label": "htop" },
+            { "command": "docker stats", "label": "docker" }
+          ]
+        }
+      ]
+    }
+  ]
+}
