@@ -1,51 +1,104 @@
 # hyperpanes-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for **[hyperpanes](https://github.com/)** —
-the Electron terminal-workspace app (one window of tiled, labeled, color-framed terminal
-panes). It lets an agent **compose, validate, and launch** terminal-workspace layouts.
+[![CI](https://github.com/Eyalm321/hyperpanes-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Eyalm321/hyperpanes-mcp/actions/workflows/ci.yml)
 
-This is a **separate project** from the hyperpanes app. It builds against the workspace
-schema and CLI grammar shipped in the app's `src/main/workspace.ts`.
+An [MCP](https://modelcontextprotocol.io) server for **hyperpanes** — the Electron
+terminal-workspace app (one window of tiled, labeled, color-framed terminal panes). It lets
+an agent **compose and launch** workspace layouts and **drive a running instance** — read,
+spawn, and arrange panes, stream their output, and (guarded) type into live shells — from
+Claude, Cursor, or any MCP client.
 
-## Status — Phase 1 (stateless launch-config)
+It works at two levels, and you can use either without the other:
 
-Phase 1 is **stateless**: it generates and validates workspace configs and shells out to
-hyperpanes to launch them. It has **no dependency on a running app**.
+| Level | Needs a running app? | What it does |
+|---|---|---|
+| **Compose & launch** | No | Generate/validate a workspace config and shell out to `hyperpanes` to open it. |
+| **Live control** | Yes | Talk to the app's loopback control API to inspect/drive panes and stream output. |
 
-| Tool | What it does |
-| --- | --- |
+> **Live control is off by default.** The app's control API is a loopback (`127.0.0.1`),
+> token-authenticated server that only listens once you enable Preferences → **"Allow agent
+> control"** in hyperpanes. Typing into shells (`send_input`) is gated further still — see the
+> [send_input safety model](#send_input-safety-model).
+
+## Tools
+
+### Compose & launch (no running app needed)
+
+| Tool | Description |
+|---|---|
 | `list_layouts` | List the tab layouts (`auto`, `single`, `columns`, `rows`, `grid`, `main-stack`) with descriptions. |
-| `validate_workspace` | Validate a workspace spec against the schema. Returns `{ valid, errors?, summary }`. |
-| `build_workspace` | Validate + return canonical workspace JSON; optionally write to a `.json` file; include the equivalent CLI command when losslessly expressible. |
-| `launch_workspace` | Launch hyperpanes with a workspace (from a `.json` path or an inline spec). |
+| `validate_workspace` | Validate a workspace spec against the schema. Returns `{ valid, errors?, summary }` (window/tab/pane counts). |
+| `build_workspace` | Validate + return canonical workspace JSON; optionally write it to a `.json` file; include the equivalent `hyperpanes` CLI command when losslessly expressible. |
+| `launch_workspace` | Launch `hyperpanes` with a workspace, from a `.json` path or an inline spec. Defaults to a lossless temp-file launch; `mode:"cli"` compiles to flags. Needs `HYPERPANES_BIN`. |
 
-**Phase 2 (live control)** is also built — a thin adapter over the app's loopback control
-API (`control-server.ts`, M2/M2b). See [Phase 2 — live control](#phase-2--live-control) and
-the [`send_input` safety model](#send_input-safety-model).
+### Inspect a running instance
 
-## Install & build
+| Tool | Description |
+|---|---|
+| `control_status` | Is the control API reachable? Reports app pid/version, whether the app allows input, the bridge-side `send_input` gate, and the `control.json` path. **Call this first.** |
+| `list_panes` | All panes across windows/tabs, with status, activity (busy/idle/exited), org metadata, tab/window context, and each pane's output-resource URI. |
+| `read_pane` | A pane's terminal scrollback. `tail` = last N lines; `strip` = ANSI-stripped clean text. |
+| `read_messages` | Drain a pane's durable message inbox past a cursor (`after` = highest seq seen). |
+| `whoami` | Identify the pane this bridge is running inside (`HYPERPANES_PANE_ID`) and its org metadata — so a manager-agent-in-a-pane can learn who it is before driving sub-workers. |
 
-```bash
-npm install
-npm run build      # -> dist/
-npm test           # unit tests (schema, CLI compiler, control client/model/gates)
-node scripts/smoke.mjs   # end-to-end stdio smoke test, both phases (no app needed)
-```
+### Drive panes
 
-Requires Node ≥ 20 (developed on Node 24).
+| Tool | Description |
+|---|---|
+| `open_pane` | Open a new pane in a window's active tab (defaults to the first window). Returns the new `paneId`; accepts `meta` (org metadata) and `env` (e.g. a scoped token) at spawn. |
+| `set_layout` | Set a tab's tiling layout (defaults to the first window's active tab). |
+| `focus_pane` | Focus a pane (and its tab/window). |
+| `close_pane` | Close a pane, terminating its shell. |
+| `restart_pane` | Kill and respawn a pane's shell. |
+| `rename_pane` | Change a pane's label and (optionally) subtitle, live. |
+| `recolor_pane` | Change a pane's frame color, live (any CSS color). |
+| `set_meta` | Attach/update a pane's free-form metadata (merge; `null` deletes a key). How an orchestrator records the org chart as data. |
 
-## Use as an MCP server
+### Send input
 
-The server speaks MCP over stdio. Register it with your client, e.g. Claude Code:
+| Tool | Description |
+|---|---|
+| `send_input` ⚠️ | **Type into a live shell** — runs whatever you send in a real terminal. Triple-gated and never on by default. See the [safety model](#send_input-safety-model). |
 
-```jsonc
+### Agent orchestration
+
+Turn the control plane into a substrate for an LLM **agent org** — one orchestrator driving
+worker panes, or a recursive manager→worker tree. Hierarchy is **data** (`meta.parent`), the
+message bus is hierarchy-agnostic, and tokens scope what a child can reach.
+
+| Tool | Description |
+|---|---|
+| `send_message` | Enqueue a structured message to a pane's durable inbox (at-least-once delivery). |
+| `send_to_parent` | Message this pane's org parent (resolved from `meta.parent`). |
+| `broadcast_subtree` | Message every pane in an org subtree (all panes whose `meta.parent` chain leads back to a root). |
+| `mint_token` | Mint a subtree-scoped control token (no escalation) to hand a child via `open_pane` env — the child controls only its subtree and never sees the master token. |
+| `lock_pane` | Take an advisory write lock so only the holder can `send_input` until it expires. |
+| `unlock_pane` | Release an advisory write lock you hold. |
+
+## Resources
+
+Pane output and inboxes are exposed as **subscribable MCP resources** — read for a snapshot,
+subscribe for a live stream (the bridge consumes the app's `/events` WebSocket and emits
+`resources/updated` / `resources/list_changed` notifications):
+
+| Resource URI | Content |
+|---|---|
+| `hyperpanes://pane/{paneId}/output` | Terminal output — scrollback on read, deltas on subscribe (`text/plain`). |
+| `hyperpanes://pane/{paneId}/messages` | The pane's durable message inbox — JSON on read, live deliveries on subscribe. |
+
+## Installation
+
+The server runs over stdio and is launched by your MCP client.
+
+### Claude Desktop / generic MCP config
+
+```json
 {
   "mcpServers": {
     "hyperpanes": {
-      "command": "node",
-      "args": ["C:/hyperpanes-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "hyperpanes-mcp"],
       "env": {
-        // Required only for launch_workspace — see "Launching" below.
         "HYPERPANES_BIN": "C:/path/to/hyperpanes.exe"
       }
     }
@@ -53,179 +106,137 @@ The server speaks MCP over stdio. Register it with your client, e.g. Claude Code
 }
 ```
 
-During development you can point `command`/`args` at `npx tsx src/index.ts` instead of the
-build.
+`HYPERPANES_BIN` is only needed for `launch_workspace`; the live-control tools find the app
+via its `control.json` (see [Configuration](#configuration)).
 
-## Workspace schema (the contract)
+### Claude Code
 
-A faithful mirror of `WorkspaceFile` in the app's `src/main/workspace.ts`. The canonical
-shape is nested; the legacy single-window fields are kept for back-compat.
-
-```
-WorkspaceFile {
-  name?, layout?,                 // legacy single-window fields…
-  panes?: PaneSpec[],             // …(absent `windows` ⇒ these describe one window)
-  groups?: GroupSpec[],
-  active?: number,
-  windows?: WindowSpec[]          // canonical multi-window
-}
-WindowSpec { title?, active?: number, bounds?: WindowBounds, groups: GroupSpec[] }
-GroupSpec  { title?, layout?: Layout, panes: PaneSpec[],     // a tab
-             sizes?: number[], mainFraction?, focused?, zoomed? }  // split/focus/zoom (JSON-only)
-PaneSpec   { label?, subtitle?, color?, command?, cwd?, shell?, fontSize? }
-WindowBounds { x?, y?, width?, height?, maximized?, fullscreen? }
-Layout = 'auto' | 'single' | 'columns' | 'rows' | 'grid' | 'main-stack'
+```bash
+claude mcp add hyperpanes -- npx -y hyperpanes-mcp
 ```
 
-A tab can fully reproduce its split and selection: `sizes` are per-pane fractions
-(summed→1, length = pane count), `mainFraction` is the Main+Stack split, and `focused` /
-`zoomed` are pane **indices** (which pane is focused / maximized). All four are JSON-only —
-the CLI grammar can't express them, so a `cli` launch drops them (reported in `lossy`).
+### Install globally
 
-- **Normalization.** Everything funnels through `windowsOf` (a line-for-line port of the
-  app's normalizer): `windows[]` is used verbatim (groupless windows dropped); else
-  top-level `groups[]` become one window of tabs; else top-level `panes[]` become one
-  window with one tab.
-- **Relative `cwd`.** In a workspace **file**, relative `cwd` resolves against the file's
-  own directory (done by the app on load). Inline specs passed to `launch_workspace` are
-  written to a temp file, so relative `cwd` resolves against the temp dir — prefer absolute
-  `cwd` for inline specs.
-- **Validation is strict.** Unknown keys are rejected (typo guard), `layout` must be a known
-  id, `fontSize` must be a positive integer, and a workspace must declare at least one pane.
+```bash
+npm install -g hyperpanes-mcp
+hyperpanes-mcp   # runs the stdio server
+```
+
+Also published to GitHub Packages as `@eyalm321/hyperpanes-mcp`.
+
+## Configuration
+
+All variables are optional. `launch_workspace` needs a launcher; the live-control tools need
+the app running with **"Allow agent control"** enabled.
+
+| Env var | Purpose |
+|---|---|
+| `HYPERPANES_BIN` | Path to the hyperpanes executable (for `launch_workspace`). No PATH fallback — it fails loudly rather than spawn the wrong process. |
+| `HYPERPANES_LAUNCH_ARGS` | Whitespace-separated leading args for the launcher (e.g. a dev runner). |
+| `HYPERPANES_CONTROL_FILE` | Override the path to the app's `control.json` (use if the app runs under a non-default data dir). |
+| `HYPERPANES_USER_DATA` | Override just the userData dir; `<dir>/control.json` is used. |
+| `HYPERPANES_CONTROL_TOKEN` / `HYPERPANES_CONTROL_PORT` | A scoped control token + port for a child pane (set automatically by `mint_token` / `open_pane` env). Used instead of reading `control.json`. |
+| `HYPERPANES_PANE_ID` | The pane this bridge runs inside — enables `whoami` and the hierarchy helpers. |
+| `HYPERPANES_ALLOW_INPUT` | `1`/`true` to permit `send_input` on this bridge (off by default). |
+| `HYPERPANES_INPUT_ALLOWLIST` | Comma-separated pane ids or labels allowed to receive input. |
+
+Default `control.json` locations:
+
+- **Windows:** `%APPDATA%\hyperpanes\control.json`
+- **macOS:** `~/Library/Application Support/hyperpanes/control.json`
+- **Linux:** `$XDG_CONFIG_HOME/hyperpanes/control.json` (or `~/.config/hyperpanes/…`)
+
+## send_input safety model
+
+> `send_input` types into **live shells** — it runs whatever you send in a real terminal. It
+> is the sharp edge of this server and is **never on by default**. Three independent gates,
+> all required:
+
+1. **App-side (enforced by hyperpanes):** the control server is loopback + token, **disabled
+   by default**, and `send_input` returns **403 unless** "Allow agent control → input" is on.
+   The bridge cannot bypass this.
+2. **Bridge opt-in:** refused unless **`HYPERPANES_ALLOW_INPUT=1`** is set in this server's
+   environment. Optionally **`HYPERPANES_INPUT_ALLOWLIST`** restricts which panes accept input.
+3. **Per-call confirmation:** every call must pass **`confirm: true`**.
+
+`control_status` surfaces all three (`appAllowsInput` + `inputGate`) so a refusal is always
+explainable.
+
+## Workspace schema
+
+A faithful mirror of the app's `WorkspaceFile`. The canonical shape is nested; the legacy
+single-window fields are kept for back-compat, and everything normalizes through one
+`windowsOf` funnel (windows[] verbatim → groups[] as one window → panes[] as one window/tab).
+
+```
+WorkspaceFile { name?, layout?, panes?, groups?, active?, windows? }
+WindowSpec    { title?, active?, bounds?, groups[] }
+GroupSpec     { title?, layout?, panes[], sizes?, mainFraction?, focused?, zoomed? }   // a tab
+PaneSpec      { label?, subtitle?, color?, command?, cwd?, shell?, fontSize? }
+Layout        = auto | single | columns | rows | grid | main-stack
+```
+
+- **Launch modes.** `launch_workspace` defaults to writing a temp `.json` (**lossless**).
+  `mode:"cli"` compiles to `--window`/`--tab`/`-c …` flags — convenient but **lossy**: window
+  bounds, the active-tab index, pane subtitle, split sizes, and command-less panes are JSON-only
+  and reported in `lossy`.
+- **Relative `cwd`.** In a workspace *file*, relative `cwd` resolves against the file's dir.
+  Inline specs are written to a temp file — prefer absolute `cwd` for inline specs.
+- **Strict validation.** Unknown keys are rejected (typo guard), `layout` must be a known id,
+  `fontSize` a positive integer, and a workspace must declare at least one pane.
 
 See [`examples/dev.workspace.json`](examples/dev.workspace.json) for a full two-window spec.
 
-## Launching
+## Development
 
-hyperpanes ships as an Electron **app**, not a CLI on `PATH` (its `package.json` has no
-`bin`). So `launch_workspace` needs to be told how to start it:
+```bash
+npm install
+npm run build      # tsc -> dist/
+npm test           # vitest (pure units; no running app needed)
+npm run test:watch
+npm run dev        # tsx src/index.ts
+node scripts/smoke.mjs   # end-to-end stdio check (no app needed)
+```
 
-1. the `launcher` tool argument, or
-2. the **`HYPERPANES_BIN`** env var (path to the built/installed executable).
+The unit tests mirror the app's own `workspace.test.ts` / control read-model cases, so a
+contract drift in the app surfaces here as a test failure.
 
-Optional leading args (e.g. for a dev runner) come from **`HYPERPANES_LAUNCH_ARGS`**
-(whitespace-separated). There is **no** bare-`hyperpanes` PATH fallback — the tool fails
-loudly rather than spawn the wrong process.
-
-Two launch modes:
-
-- **`file`** (default) — writes the workspace to a temp `.json` and launches
-  `hyperpanes <file>`. **Lossless.**
-- **`cli`** — compiles the workspace to `--window`/`--tab`/`-c …` flags. Convenient and
-  copy-pasteable, but **lossy**: the CLI grammar cannot express window `bounds`, the
-  `active` tab index, pane `subtitle`, or a pane with no `command`. `build_workspace` /
-  `launch_workspace` report which fields a CLI launch would drop.
-
-## Phase 2 — live control
-
-A thin adapter over the app's **local control API** (`control-server.ts`, M2/M2b): a loopback
-`127.0.0.1` HTTP server + `/events` WebSocket, **off by default**, with a per-instance bearer
-token. It is enabled in the app via Preferences → "Allow agent control".
-
-| Tool | What it does |
-| --- | --- |
-| `control_status` | Is control reachable? Reports app pid/version, whether the app allows input, the bridge-side `send_input` gate, and the `control.json` path. **Call this first.** |
-| `list_panes` | All panes across windows/tabs, with status, **activity** (`busy`/`idle`/`exited` liveness heuristic), any **org metadata** (`role`/`parent`/`agentType`/`task`), and each pane's output-resource URI. |
-| `read_pane` | A pane's scrollback (`tail` = last N lines; `strip` = ANSI-stripped clean text). |
-| `open_pane` | New pane in a window's active tab (defaults to the first window). Returns the **new paneId**; accepts `meta` (org metadata) and `env` (e.g. a scoped control token) at spawn. |
-| `set_meta` | Attach/update a pane's free-form `meta` (shallow-merged). How an orchestrator records the org chart as data. |
-| `set_layout` | Set a tab's layout (defaults to the first window's active tab). |
-| `focus_pane` / `close_pane` / `restart_pane` | Focus, close, or restart a pane. |
-| `rename_pane` / `recolor_pane` | Change a pane's label + subtitle, or its frame color — live. |
-| `send_input` | **Guarded** — type into a live shell. See [safety model](#send_input-safety-model). Pass `owner` to write a pane you've `lock_pane`-d. |
-| `whoami` | Identify the pane this bridge runs inside (`HYPERPANES_PANE_ID`) + its org metadata. The recursion enabler. |
-| `send_message` / `read_messages` | Durable per-pane message bus (at-least-once, cursor reads). |
-| `send_to_parent` / `broadcast_subtree` | Hierarchy helpers — message your org `meta.parent`, or every pane in your subtree. |
-| `mint_token` | Mint a narrower (subtree-scoped) control token to hand a child via `open_pane` env. |
-| `lock_pane` / `unlock_pane` | Advisory write lock so only the holder can `send_input` until it expires. |
-
-### Agent orchestration (Phases A–C)
-
-These tools turn the control plane into a substrate for an LLM **agent org** — one external
-orchestrator driving worker panes, or a recursive CEO→manager→worker tree. Hierarchy is **data**
-(per-pane `meta` + the window→tab→pane tree), never baked into the API, so the same primitives
-serve both shapes. See `docs/agent-orchestration-plan.md` in the app repo.
-
-- **Self-awareness.** Each pane's pty gets `HYPERPANES_PANE_ID` + `HYPERPANES_CONTROL_FILE`, so
-  an MCP bridge running *inside* a pane learns who it is via `whoami`.
-- **Liveness.** `list_panes` reports `activity` (`busy`/`idle`/`exited` — a quiescence
-  **heuristic**, not a "done" guarantee) and a `state`/`activity` event stream.
-- **Messaging.** `send_message`/`read_messages` (+ the subscribable
-  `hyperpanes://pane/{id}/messages` resource) are a durable, at-least-once inbox per pane;
-  `send_to_parent`/`broadcast_subtree` resolve targets from `meta`.
-- **Scoping (opt-in).** The master token (in `control.json`) is unscoped. `mint_token` issues a
-  subtree-scoped, optionally-TTL'd token that can only reach its windows/tabs/panes and can only
-  mint *narrower* children. Hand it to a child via `open_pane({ env: { HYPERPANES_CONTROL_TOKEN,
-  HYPERPANES_CONTROL_PORT } })` — the child then controls only its subtree and is **never given
-  the master `control.json`**. A scoped token's `/state` and event stream are filtered to its panes.
-- **Concurrency.** `lock_pane` takes an advisory write lock; a locked pane refuses `send_input`
-  from anyone but the holder (pass `owner`). Unlocked panes are writable by anyone.
-
-> **Activity is a heuristic.** `idle` means a pane produced no output for the app's idle
-> threshold — the agent is *likely* waiting at its prompt or done, **not** a guarantee work is
-> complete. An agent that streams/thinks silently can read as idle; a chatty one may never idle.
-
-**Pane self-awareness.** Each pane's pty is launched with `HYPERPANES_PANE_ID` (its own paneId)
-and `HYPERPANES_CONTROL_FILE` (the path to `control.json`), so an MCP-capable agent running
-*inside* a pane can discover which pane it is and how to reach this control plane.
-
-**Discovery.** The bridge reads the app's `userData/control.json`
-(`{ port, token, pid, version, events }`). Path precedence: `HYPERPANES_CONTROL_FILE` →
-`HYPERPANES_USER_DATA`/`control.json` → platform default
-(`%APPDATA%/hyperpanes/control.json` on Windows, `~/Library/Application Support/hyperpanes/…`
-on macOS, `$XDG_CONFIG_HOME/hyperpanes/…` on Linux). In dev the app may run under a different
-Electron name — set `HYPERPANES_CONTROL_FILE` if `control_status` reports the wrong path.
-
-**Streaming.** Each pane's output is an MCP **resource** at `hyperpanes://pane/{paneId}/output`.
-Reading it returns the scrollback; **subscribing** streams updates: the bridge opens the app's
-`/events` WebSocket and turns `output`/`exit` frames into `resources/updated` notifications and
-`state` frames into `resources/list_changed`. (No WebSocket is exposed by the bridge — it
-*consumes* the app's; clients get plain MCP notifications over stdio.) Pane **activity** flips
-also coalesce into a `state` frame, so a subscriber gets a `list_changed` nudge and can re-read
-the new `activity` via `list_panes`.
-
-## `send_input` safety model
-
-> `send_input` lets an agent **type into live shells** — it runs whatever you send in a real
-> terminal. It is the sharp edge of this project and is **never on by default**. Three gates,
-> all required, do not weaken:
-
-1. **App-side (enforced by hyperpanes):** the control server is loopback-only + token, is
-   **disabled by default**, and `send_input` returns **403 unless** "Allow agent control →
-   input" (`allowInput`) is toggled on in the app. The bridge cannot bypass this.
-2. **Bridge opt-in (allowlist):** the MCP server refuses `send_input` unless
-   **`HYPERPANES_ALLOW_INPUT=1`** is set in its environment. Optionally
-   **`HYPERPANES_INPUT_ALLOWLIST`** (comma-separated pane ids or labels) restricts which panes
-   accept input.
-3. **Per-call confirmation:** every `send_input` call must pass **`confirm: true`**.
-
-`control_status` surfaces all three (`appAllowsInput` + `inputGate`) so you can see exactly
-why a call would be refused.
-
-## Project layout
+## Architecture
 
 ```
 src/
-  schema.ts          # zod schema + types + windowsOf/summarize (mirrors workspace.ts)
-  compile-cli.ts     # WorkspaceFile -> hyperpanes CLI argv (inverse of the app's parseCli)
-  launch.ts          # launcher resolution + launch planning/execution
-  server.ts          # MCP server: registers Phase 1 tools + Phase 2 (control) tools
-  control-tools.ts   # Phase 2 tools + the subscribable pane-output resource
+  index.ts          # stdio entrypoint
+  server.ts         # creates the MCP server; registers compose/launch tools + wires control tools
+  schema.ts         # workspace schema (zod) + windowsOf/summarize — mirrors the app's workspace.ts
+  compile-cli.ts    # WorkspaceFile -> hyperpanes CLI argv (inverse of the app's parseCli)
+  launch.ts         # launcher resolution + launch planning/execution
+  control-tools.ts  # live-control + orchestration tools, and the subscribable pane resources
   control/
-    discovery.ts     # locate + parse userData/control.json
-    client.ts        # HTTP client for the control API (state/output/input/command)
-    model.ts         # read-model types + pure helpers (flatten, resolve, URIs)
-    subscriptions.ts # /events WebSocket -> MCP resource notifications
-    input-gate.ts    # send_input gating (opt-in + confirm + allowlist)
-  index.ts           # stdio entrypoint
-scripts/smoke.mjs    # end-to-end stdio check (both phases; no app needed)
-examples/            # sample workspace files
+    discovery.ts    # locate + parse control.json (and scoped-token env)
+    client.ts       # HTTP client for the control API (state/output/input/command/messages/tokens/locks)
+    model.ts        # read-model types + pure helpers (flatten, resolve, URIs, whoami, subtree)
+    subscriptions.ts# /events WebSocket -> MCP resource notifications
+    input-gate.ts   # send_input gating (opt-in + confirm + allowlist)
+scripts/smoke.mjs   # end-to-end stdio check
+examples/           # sample workspace files
 ```
 
-## Keeping in sync with the app
+## Releasing
 
-`src/schema.ts` and `src/compile-cli.ts` mirror the app's `src/main/workspace.ts`
-(`WorkspaceFile`/`windowsOf`/`parseCli`); `src/control/*` mirrors `control-server.ts`
-(routes, `/events` frames, `control.json`). The test suites intentionally reuse the app's own
-test cases so drift surfaces as a failure. If the app's schema, CLI grammar, or control API
-changes, update the corresponding files and their tests.
+CI runs the build + tests on every push and PR to `main` (Node 20 & 22). Publishing is
+triggered by creating a **GitHub Release**, which publishes to **both** registries:
+
+- **npm** as the unscoped package `hyperpanes-mcp`
+- **GitHub Packages** as `@eyalm321/hyperpanes-mcp`
+
+### One-time repo setup
+
+1. Add an `NPM_TOKEN` repository secret (an npm **automation** token). `GITHUB_TOKEN` is
+   provided automatically for GitHub Packages.
+2. To release: `npm version <patch|minor|major>`, push with `--follow-tags`, then create a
+   GitHub Release for the tag (e.g. `v0.1.1`). The `publish` workflow builds, tests, and
+   publishes to both registries.
+
+## License
+
+MIT © Eyalm321
