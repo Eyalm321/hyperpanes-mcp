@@ -48,6 +48,47 @@ function errMessage(err: unknown): string {
 }
 
 /**
+ * Heuristic: did a `prompt_pane` submit fail to register? A freshly-launched TUI
+ * can drop the trailing bare CR that submits a line — its input loop isn't armed
+ * yet, so the text lands in the input box but is never sent (cold-start race; see
+ * the app's control-input.ts "live finding, 2026-06-05"). The turn-aware wait is
+ * no help on its own: the paste ECHO advances output past the cursor, so the read
+ * still reports `settled:true` exactly as a real turn would. The tell is the
+ * CONTENT — only our own keystrokes came back, with no reply after them.
+ *
+ * We compare the raw output delta (everything the pane emitted since just before
+ * the send) against the text we typed, both reduced to alphanumerics. After
+ * removing the echo, a genuine reply leaves a substantial residual; a dropped
+ * submit leaves only input-box / status-line redraw noise.
+ *
+ * Tuned to err toward retrying: a false positive costs one extra bare Enter,
+ * which is a no-op in an already-empty input box, whereas a false negative leaves
+ * the prompt stuck unsent. A `timedOut` turn means the agent is still working
+ * (output never went quiet) — NOT a dropped submit — so those never qualify.
+ */
+export function submitLikelyDropped(
+  rawDelta: string,
+  text: string,
+  settled: boolean,
+  timedOut: boolean
+): boolean {
+  if (!settled || timedOut) return false;
+  const norm = (s: string): string => s.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const deltaNorm = norm(rawDelta);
+  const textNorm = norm(text);
+  const echoIdx = textNorm.length > 0 ? deltaNorm.indexOf(textNorm) : -1;
+  // Strip one occurrence of the echoed text; what's left should be a real reply
+  // (large) or just redraw chrome (small). When the echo wrapped oddly and isn't
+  // a clean substring, fall back to a length subtraction.
+  const residualLen =
+    echoIdx >= 0 ? deltaNorm.length - textNorm.length : Math.max(0, deltaNorm.length - textNorm.length);
+  // Below this many alphanumerics beyond the echo, nothing but input-box / status
+  // redraw came back — no reply. A genuine reply dwarfs it.
+  const ECHO_NOISE_CEILING = 64;
+  return residualLen <= ECHO_NOISE_CEILING;
+}
+
+/**
  * Register Phase 2 (M4) live-control tools and the subscribable pane-output
  * resource on an McpServer. The server must declare the
  * `resources: { subscribe, listChanged }` capability (see server.ts).
@@ -444,15 +485,26 @@ export function registerControlTools(server: McpServer): void {
         // Snapshot the byte cursor BEFORE sending so the wait is turn-aware: it
         // won't settle until output advances past here (the reply has begun).
         const before = await c.readPane(paneId);
+        const readReply = () =>
+          c.readPane(paneId, { since: before.cursor, waitForIdle: true, settleMs, timeoutMs, mode: 'screen', tail });
         await c.sendInput(paneId, text, owner, true);
-        const reply = await c.readPane(paneId, {
-          since: before.cursor,
-          waitForIdle: true,
-          settleMs,
-          timeoutMs,
-          mode: 'screen',
-          tail
-        });
+        let reply = await readReply();
+        // Cold-start self-heal: a just-launched TUI can swallow the first submit's
+        // bare CR, leaving the text typed but unsent (see submitLikelyDropped).
+        // If the turn came back as echo-with-no-reply AND this pane is still early
+        // in its life (small byte cursor ⇒ the only window the drop happens in),
+        // fire one corrective Enter and re-read. The extra CR is a no-op if the
+        // box turned out to be empty, so a misfire is harmless. Capped at one try.
+        const COLD_START_BYTES = 16_000;
+        let recovered = false;
+        if ((before.cursor ?? 0) < COLD_START_BYTES) {
+          const delta = await c.readPane(paneId, { since: before.cursor, strip: true });
+          if (submitLikelyDropped(delta.output ?? '', text, reply.settled ?? false, reply.timedOut ?? false)) {
+            await c.sendInput(paneId, '', owner, true); // bare Enter — submit what's sitting in the box
+            reply = await readReply();
+            recovered = true;
+          }
+        }
         return {
           ok: true,
           paneId,
@@ -460,6 +512,7 @@ export function registerControlTools(server: McpServer): void {
           timedOut: reply.timedOut ?? false,
           awaitingInput: reply.awaitingInput ?? false,
           cursor: reply.cursor,
+          ...(recovered ? { recovered: true } : {}),
           reply: reply.output
         };
       })
