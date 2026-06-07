@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { LayoutSchema } from './schema.js';
+import { LayoutSchema, GroupSpecSchema } from './schema.js';
 import { ControlUnavailableError, readDiscovery, controlFilePath } from './control/discovery.js';
 import { ControlClient } from './control/client.js';
 import {
@@ -271,6 +271,33 @@ export function registerControlTools(server: McpServer): void {
         // pane still exists, the read-model just lagged unusually.
         const ready = await c.waitForPane(paneId);
         return { ok: true, windowId: target, paneId, ready };
+      })
+  );
+
+  // ---- open_tab --------------------------------------------------------
+  server.registerTool(
+    'open_tab',
+    {
+      title: 'Open tab(s)',
+      description:
+        'Attach one or more new tabs to an existing window (defaults to the first window), each with fresh shells — the programmatic equivalent of `hyperpanes --attach`. Returns the new tab ids. Use this (not open_pane) to add a whole tab, or several tabs, in one call. Pass `as:"panes"` to instead merge ALL the given panes into the window\'s ACTIVE tab (returns the new pane ids). Each group is one tab: { title?, layout?, panes:[{ command?, args?, label?, cwd?, shell?, color?, meta? }] }.',
+      inputSchema: {
+        groups: z.array(GroupSpecSchema).min(1),
+        as: z.enum(['tab', 'panes']).optional(),
+        windowId: z.number().int().optional()
+      }
+    },
+    async ({ groups, as, windowId }) =>
+      run(async (c) => {
+        const state = await c.state();
+        const target = windowId ?? firstWindowId(state);
+        if (target == null) throw new Error('no windows open to attach to');
+        const unit = as ?? 'tab';
+        // The app returns the new tab ids (unit:'tab') or pane ids (unit:'panes')
+        // via the command round-trip (D), mirroring newPane → id.
+        const res = await c.command({ type: 'attach', windowId: target, groups, as: unit });
+        const ids = Array.isArray(res.result) ? (res.result as string[]) : [];
+        return { ok: true, windowId: target, as: unit, ids };
       })
   );
 
