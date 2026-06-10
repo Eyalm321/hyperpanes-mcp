@@ -236,7 +236,10 @@ export function registerControlTools(server: McpServer): void {
           .describe(
             'With `command`: run it directly with this verbatim argv (no shell re-parse). Each element is one argument — do NOT pre-quote.'
           ),
-        label: z.string().optional(),
+        label: z
+          .string()
+          .max(80, 'pane label too long — pass a short title (max 80 chars), not a command line')
+          .optional(),
         cwd: z.string().optional(),
         shell: z.string().optional(),
         color: z.string().optional(),
@@ -379,7 +382,7 @@ export function registerControlTools(server: McpServer): void {
         'Change a pane\'s label (title) and, optionally, its subtitle — applied live to the pane header. Pass subtitle:"" to clear it; omit subtitle to leave it unchanged.',
       inputSchema: {
         paneId: z.string(),
-        label: z.string(),
+        label: z.string().max(80, 'pane label too long (max 80 chars)'),
         subtitle: z.string().optional().describe('"" clears it; omit to leave as-is')
       }
     },
