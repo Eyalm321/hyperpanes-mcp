@@ -1,12 +1,14 @@
 /**
- * In-pane worker entry (Phase 1) — doc 03 §6.
+ * In-pane worker entry (Phase 1) — doc 03 §6, repointed onto the work queue (phase-3).
  *
  * Launched by the controller via `open_pane`, cwd'd into its isolated worktree.
- * It (1) blocks until the controller writes a handshake file, (2) opens a control
- * client SCOPED to its own pane (token+port from the handshake — it is NEVER
- * handed control.json or the master token), (3) pulls its task off its own durable
- * inbox over the message bus, (4) does the work, (5) reports DONE on the bus and
- * exits so the pane becomes `exited`.
+ * It (1) blocks until the controller writes a handshake file, (2) reads its TASK and
+ * pane-scoped creds (token+port) straight from that handshake — the queue is now the
+ * dispatch substrate, so the task no longer arrives over the inbox bus, and the worker
+ * is NEVER handed control.json or the master token — (3) does the work, (4) writes the
+ * durable `RESULT.md`, (5) emits a DONE/FAIL liveness notice to its own inbox (the
+ * controller polls this) and exits so the pane becomes `exited`. The controller maps
+ * that outcome onto the queue via `ack`/`nack`.
  *
  * The "do the work" block is a mock by default (writes a trivial RESULT.md) so the
  * whole loop runs end-to-end with no API key; swap it for a real `claude` per doc
@@ -18,6 +20,7 @@
 import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { ControlClient } from '../control/client.js';
 import type { Discovery } from '../control/discovery.js';
+import type { DispatchedTask } from './kinds.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -25,13 +28,9 @@ interface Handshake {
   token: string;
   port: number;
   paneId: string;
-}
-
-interface Dispatched {
-  type: 'task';
-  id: string;
-  prompt: string;
-  title?: string;
+  /** The task to run — delivered IN the handshake (not the inbox bus) now that the
+   *  controller sources work from the durable queue. */
+  task: DispatchedTask;
 }
 
 /** Block until the controller mints a token and writes the handshake, then consume it. */
@@ -61,30 +60,6 @@ function scopedClient(hs: Handshake): ControlClient {
   return new ControlClient(discovery);
 }
 
-/** Pull the dispatched task off our own inbox (over the bus). */
-async function awaitTask(client: ControlClient, paneId: string): Promise<Dispatched | null> {
-  let cursor = 0;
-  for (let i = 0; i < 240; i++) {
-    // up to ~120s
-    const inbox = await client.readMessages(paneId, cursor).catch(() => null);
-    if (inbox) {
-      for (const m of inbox.messages) {
-        cursor = Math.max(cursor, m.seq);
-        try {
-          const body = JSON.parse(m.body) as Partial<Dispatched>;
-          if (body.type === 'task' && typeof body.id === 'string' && typeof body.prompt === 'string') {
-            return body as Dispatched;
-          }
-        } catch {
-          /* not our JSON task frame — ignore */
-        }
-      }
-    }
-    await sleep(500);
-  }
-  return null;
-}
-
 async function main(): Promise<void> {
   const handshakePath = process.env.HP_HANDSHAKE;
   if (!handshakePath) throw new Error('HP_HANDSHAKE not set — worker launched without a handshake path');
@@ -92,9 +67,9 @@ async function main(): Promise<void> {
   const hs = await waitHandshake(handshakePath);
   const client = scopedClient(hs);
 
-  const task = await awaitTask(client, hs.paneId);
-  if (!task) {
-    writeFileSync('RESULT.md', '# FAILED\n\nno task received on the bus\n', 'utf8');
+  const task = hs.task;
+  if (!task || typeof task.prompt !== 'string' || typeof task.id !== 'string') {
+    writeFileSync('RESULT.md', '# FAILED\n\nno task delivered in the handshake\n', 'utf8');
     await client.sendMessage(hs.paneId, hs.paneId, 'FAIL no-task').catch(() => {});
     process.exit(2);
   }
@@ -108,7 +83,7 @@ async function main(): Promise<void> {
     `Finished: ${new Date().toISOString()}\n`;
   writeFileSync('RESULT.md', out, 'utf8');
 
-  // Report completion over the bus (to our own inbox), then exit → pane 'exited'.
+  // Liveness notice to our own inbox (the controller polls it), then exit → pane 'exited'.
   await client.sendMessage(hs.paneId, hs.paneId, `DONE ${task.id}`).catch(() => {});
   process.exit(0);
 }

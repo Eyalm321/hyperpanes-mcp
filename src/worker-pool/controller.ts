@@ -22,7 +22,16 @@ import { ControlClient } from '../control/client.js';
 import { readDiscovery } from '../control/discovery.js';
 import { flattenPanes, firstWindowId, type ControlPane } from '../control/model.js';
 import { Git } from './git.js';
-import { deriveBranch, worktreePath, type Task } from './kinds.js';
+import {
+  deriveBranch,
+  worktreePath,
+  decodeSpec,
+  type Task,
+  type TaskSpec,
+  type EnqueueRequest,
+  type DispatchedTask
+} from './kinds.js';
+import { QueueClient } from './queue-client.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -46,6 +55,8 @@ export interface ControllerConfig {
   tokenTtlMs: number;
   /** Default base ref worktrees fork from when a task doesn't set its own. */
   base: string;
+  /** Logical work queue this controller produces into and claims from. */
+  queue: string;
   /** Private dir (outside any checkout) for short-lived handshake files. */
   handshakeDir: string;
   /** Executable that runs the worker entry (default "node"). */
@@ -79,6 +90,7 @@ export function defaultConfig(overrides: Partial<ControllerConfig> = {}): Contro
     pollIntervalMs: num(env.HP_POLL_INTERVAL_MS, 1_500),
     tokenTtlMs: num(env.HP_TOKEN_TTL_MS, 30 * 60_000),
     base: env.HP_BASE || 'HEAD',
+    queue: env.HP_QUEUE || 'default',
     handshakeDir: env.HP_HANDSHAKE_DIR || join(root, '.handshakes'),
     workerNode: env.HP_WORKER_NODE || 'node',
     workerEntry: env.HP_WORKER_ENTRY || defaultWorkerEntry(),
@@ -110,26 +122,29 @@ export interface TaskPlan {
   /** What `mint_token` will be scoped to (the paneId is filled in post-open). */
   mintScope: string;
   tokenTtlMs: number;
-  /** The bus message dispatched to the worker's inbox. */
-  dispatchBody: string;
+  /** The task frame handed to the worker via the handshake file (NOT the inbox bus). */
+  dispatch: DispatchedTask;
 }
 
-/** Pure planner — single source of truth for both dry-run and the live path. */
-export function planTask(task: Task, cfg: ControllerConfig): TaskPlan {
+/**
+ * Pure planner — single source of truth for both dry-run and the live path. Takes the
+ * canonical {@link Task} (id/title/kind/priority are queue columns) plus the {@link TaskSpec}
+ * decoded from its opaque `payload` (prompt/base/repo live there, doc 05 "typed at the edges").
+ */
+export function planTask(task: Task, spec: TaskSpec, cfg: ControllerConfig): TaskPlan {
   const branch = deriveBranch(task);
   const worktree = worktreePath(cfg.worktreeRoot, cfg.poolId, task);
-  const base = task.base || cfg.base;
+  const base = spec.base || cfg.base;
   const handshake = join(cfg.handshakeDir, `handshake-${branch.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
-  const dispatchBody = JSON.stringify({
-    type: 'task',
+  const dispatch: DispatchedTask = {
     id: task.id,
     kind: task.kind,
     title: task.title,
-    prompt: task.prompt,
+    prompt: spec.prompt,
     base,
     branch,
     worktree
-  });
+  };
   return {
     id: task.id,
     kind: task.kind,
@@ -150,7 +165,7 @@ export function planTask(task: Task, cfg: ControllerConfig): TaskPlan {
     },
     mintScope: 'paneIds:[<thisPane>]',
     tokenTtlMs: cfg.tokenTtlMs,
-    dispatchBody
+    dispatch
   };
 }
 
@@ -174,15 +189,19 @@ interface Outcome {
 
 export class Controller {
   private client!: ControlClient;
+  private queue!: QueueClient;
   private readonly git: Git;
 
   constructor(private readonly cfg: ControllerConfig) {
     this.git = new Git(cfg.repo);
   }
 
-  /** Connect to the master control API (control.json) and verify it's live. */
+  /** Connect to the master control API (control.json) and verify it's live. The same
+   *  master discovery backs both the pane client and the work-queue client. */
   async connect(): Promise<{ pid: number; version: string; port: number }> {
-    this.client = new ControlClient(readDiscovery());
+    const discovery = readDiscovery();
+    this.client = new ControlClient(discovery);
+    this.queue = new QueueClient(discovery);
     const health = await this.client.health();
     mkdirSync(this.cfg.worktreeRoot, { recursive: true });
     mkdirSync(this.cfg.handshakeDir, { recursive: true });
@@ -225,26 +244,49 @@ export class Controller {
     return { panesClosed, worktreesRemoved };
   }
 
-  /** Run a backlog through a bounded pool; results come back in completion order. */
-  async run(tasks: Task[]): Promise<TaskRunResult[]> {
-    const queue = [...tasks].sort((a, b) => b.priority - a.priority);
+  /**
+   * Repointed onto the durable work queue: PRODUCE the backlog (enqueue), then CONSUME it
+   * through a bounded pool of competing consumers. Each slot claims a task, runs it in an
+   * isolated worktree, and reports terminal state via `ack`/`nack` (carrying the fencing
+   * token) — the inbox bus is no longer the dispatch substrate. Results come back in
+   * completion order. With an empty backlog the pool simply drains whatever is already queued.
+   */
+  async run(backlog: EnqueueRequest[]): Promise<TaskRunResult[]> {
+    for (const req of backlog) {
+      await this.queue.enqueue(this.cfg.queue, req);
+    }
     const results: TaskRunResult[] = [];
-    const next = (): Task | undefined => queue.shift();
-    const runner = async (): Promise<void> => {
-      for (let task = next(); task; task = next()) {
-        results.push(await this.runTask(task));
+    const worker = async (slot: number): Promise<void> => {
+      const workerId = `${this.cfg.poolId}-w${slot}`;
+      for (;;) {
+        // lease the task for at least its wall-clock budget so it isn't reaped mid-run
+        const claimed = await this.queue.claim(this.cfg.queue, workerId, {
+          leaseMs: this.cfg.taskTimeoutMs
+        });
+        const task = claimed[0];
+        if (!task) return; // queue drained
+        results.push(await this.runClaim(task));
       }
     };
-    const n = Math.max(1, Math.min(this.cfg.maxConcurrent, queue.length));
-    await Promise.all(Array.from({ length: n }, () => runner()));
+    const slots = Math.max(1, Math.min(this.cfg.maxConcurrent, backlog.length || this.cfg.maxConcurrent));
+    await Promise.all(Array.from({ length: slots }, (_unused, i) => worker(i)));
     return results;
   }
 
-  /** One task, full lifecycle, with cleanup guaranteed in the safe order. */
-  async runTask(task: Task): Promise<TaskRunResult> {
-    const plan = planTask(task, this.cfg);
+  /**
+   * One CLAIMED task, full lifecycle, with cleanup guaranteed in the safe order and the
+   * terminal state reported back to the queue (fencing-guarded). The typed instruction is
+   * decoded from the task's opaque `payload`; the task is handed to the worker via the
+   * handshake file (not the inbox bus).
+   */
+  async runClaim(task: Task): Promise<TaskRunResult> {
+    const spec = decodeSpec(task, this.cfg.base);
+    const plan = planTask(task, spec, this.cfg);
+    const fencingToken = task.fencingToken;
     let paneId: string | null = null;
     try {
+      if (fencingToken == null) throw new Error('claimed task is missing its fencingToken');
+
       // 1. isolated checkout on a throwaway branch off the base ref
       await this.git.worktreeAdd(plan.worktree, plan.branch, plan.base);
 
@@ -255,22 +297,24 @@ export class Controller {
       const minted = await this.client.mintToken({ paneIds: [paneId] }, this.cfg.tokenTtlMs);
       if (!minted.token || minted.port == null) throw new Error('mint_token returned no token/port');
 
-      // 4. hand the scoped creds to the worker via the file it is polling
+      // 4. hand the scoped creds AND the task to the worker via the file it polls — the
+      //    queue is the dispatch substrate now, so nothing rides the inbox bus.
       writeFileSync(
         plan.handshake,
-        JSON.stringify({ token: minted.token, port: minted.port, paneId }),
+        JSON.stringify({ token: minted.token, port: minted.port, paneId, task: plan.dispatch }),
         'utf8'
       );
 
-      // 5. dispatch the task over the durable bus
-      await this.client.sendMessage(paneId, 'controller', plan.dispatchBody);
-
-      // 6. poll for completion (explicit signal first, then process-gone)
+      // 5. poll for completion (worker DONE/FAIL liveness notice first, then process-gone)
       const outcome = await this.pollUntilDone(paneId, Date.now() + this.cfg.taskTimeoutMs);
 
-      // 7. collect the durable artifact
+      // 6. collect the durable artifact
       const resultPath = join(plan.worktree, 'RESULT.md');
       const result = existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : null;
+
+      // 7. report terminal state to the QUEUE (ack on success, nack otherwise)
+      await this.report(task.id, fencingToken, outcome, result);
+
       return {
         id: task.id,
         ok: outcome.ok,
@@ -282,6 +326,12 @@ export class Controller {
         result
       };
     } catch (err) {
+      // best-effort requeue so a crashed run doesn't strand the task as `claimed`
+      if (fencingToken != null) {
+        await this.queue
+          .nack(task.id, fencingToken, { requeue: true, error: errMessage(err) })
+          .catch(() => {});
+      }
       return {
         id: task.id,
         ok: false,
@@ -294,6 +344,31 @@ export class Controller {
     } finally {
       // 8. always tear down — pane FIRST, then the directory it cwd'd into
       await this.teardown({ paneId, worktree: plan.worktree, branch: plan.branch, handshake: plan.handshake });
+    }
+  }
+
+  /**
+   * Translate a worker outcome into the queue's terminal signal, fencing-guarded.
+   * A timeout is requeued (worth retrying); an explicit fail / non-zero exit gives up.
+   * Best-effort: a 409 means the lease was already superseded, so there's nothing to record.
+   */
+  private async report(
+    taskId: string,
+    fencingToken: number,
+    outcome: Outcome,
+    result: string | null
+  ): Promise<void> {
+    try {
+      if (outcome.ok) {
+        await this.queue.ack(taskId, fencingToken, result ?? undefined);
+      } else {
+        await this.queue.nack(taskId, fencingToken, {
+          requeue: outcome.reason === 'timeout',
+          error: outcome.reason
+        });
+      }
+    } catch {
+      /* lease superseded (409) or queue unreachable — non-fatal */
     }
   }
 
