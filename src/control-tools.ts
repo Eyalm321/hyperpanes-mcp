@@ -227,7 +227,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Open pane',
       description:
-        'Open a new pane in the active tab of a window (defaults to the first window). Returns the new paneId. `command` alone runs through the shell. Pass `args` (a string array) to run `command` DIRECTLY as the executable with that exact argv — no shell, no re-parse — which is the reliable way to pass arguments containing spaces or quotes (e.g. command:"claude", args:["--append-system-prompt","…long persona…"]); a single `command` string with such args gets mangled by the shell. `meta` attaches free-form org metadata (reserved keys: role/parent/agentType/task) so the new worker is self-describing.',
+        'Open a new pane in the active tab of a window (defaults to the first window). Returns the new paneId. `command` alone runs through the shell. Pass `args` (a string array) to run `command` DIRECTLY as the executable with that exact argv — no shell, no re-parse — which is the reliable way to pass arguments containing spaces or quotes (e.g. command:"claude", args:["--append-system-prompt","…long persona…"]); a single `command` string with such args gets mangled by the shell. `meta` attaches free-form org metadata (reserved keys: role/parent/agentType/task) so the new worker is self-describing. `project` opens the pane in a remembered project (see list_projects/add_project): it defaults the pane\'s cwd + frame color from that project and bumps its recency in the sidebar rail.',
       inputSchema: {
         command: z.string().optional(),
         args: z
@@ -249,10 +249,16 @@ export function registerControlTools(server: McpServer): void {
         // HYPERPANES_CONTROL_PORT: <port> } here — the child then reaches only its
         // subtree, and is NOT given the master control.json.
         env: z.record(z.string(), z.string()).optional(),
+        project: z
+          .string()
+          .optional()
+          .describe(
+            'open the pane in a remembered project (its id or name; see list_projects): defaults cwd + frame color from the project and bumps its recency. An explicit cwd/color still wins; an unknown handle fails the call.'
+          ),
         windowId: z.number().int().optional()
       }
     },
-    async ({ command, args, label, cwd, shell, color, meta, env, windowId }) =>
+    async ({ command, args, label, cwd, shell, color, meta, env, project, windowId }) =>
       run(async (c) => {
         const state = await c.state();
         const target = windowId ?? firstWindowId(state);
@@ -260,7 +266,7 @@ export function registerControlTools(server: McpServer): void {
         const res = await c.command({
           type: 'newPane',
           windowId: target,
-          pane: { label, command, args, cwd, shell, color, meta, env }
+          pane: { label, command, args, cwd, shell, color, meta, env, project }
         });
         // The app returns the new pane id via the command round-trip (D). A
         // missing id means the round-trip failed (a timed-out/wedged renderer now
@@ -302,6 +308,63 @@ export function registerControlTools(server: McpServer): void {
         const ids = Array.isArray(res.result) ? (res.result as string[]) : [];
         return { ok: true, windowId: target, as: unit, ids };
       })
+  );
+
+  // ---- projects (the remembered-directory registry / sidebar rail) -----
+  server.registerTool(
+    'list_projects',
+    {
+      title: 'List projects',
+      description:
+        'List the projects (remembered directories) the running hyperpanes instance tracks — its sidebar rail — newest-opened first. Each has an id, absolute path, name, frame color, and lastOpenedAt. Use an id (or name) with rename_project/recolor_project/remove_project, or as open_pane\'s `project` option to open a pane in it.'
+    },
+    async () => run(async (c) => ({ ok: true, projects: await c.listProjects() }))
+  );
+
+  server.registerTool(
+    'add_project',
+    {
+      title: 'Add project',
+      description:
+        'Remember a directory as a project (the programmatic equivalent of the sidebar PROJECTS ＋ button). The path must exist and be a directory; a git repo is NOT required. Adding an already-known directory is a no-op — returns added:false with the existing entry. Returns the project (id/path/name/color).',
+      inputSchema: {
+        dir: z.string().describe('absolute path to an existing directory to track as a project')
+      }
+    },
+    async ({ dir }) => run((c) => c.addProject(dir))
+  );
+
+  server.registerTool(
+    'rename_project',
+    {
+      title: 'Rename project',
+      description:
+        'Rename a remembered project by id (find ids with list_projects). The new name shows in the sidebar rail.',
+      inputSchema: { id: z.string(), name: z.string().min(1) }
+    },
+    async ({ id, name }) => run((c) => c.patchProject(id, { name }))
+  );
+
+  server.registerTool(
+    'recolor_project',
+    {
+      title: 'Recolor project',
+      description:
+        'Set a remembered project\'s frame/dot color by id (find ids with list_projects). Pass a hex color like "#a855f7"; the app retints open panes inside that project too.',
+      inputSchema: { id: z.string(), color: z.string().describe('hex color, e.g. "#a855f7"') }
+    },
+    async ({ id, color }) => run((c) => c.patchProject(id, { color }))
+  );
+
+  server.registerTool(
+    'remove_project',
+    {
+      title: 'Remove project',
+      description:
+        'Forget a remembered project by id (find ids with list_projects). Removes it from the sidebar rail; does NOT delete the directory on disk.',
+      inputSchema: { id: z.string() }
+    },
+    async ({ id }) => run((c) => c.removeProject(id))
   );
 
   // ---- set_meta --------------------------------------------------------

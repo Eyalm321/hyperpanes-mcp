@@ -64,6 +64,16 @@ export interface Scope {
   paneIds?: string[];
 }
 
+/** A remembered project (a directory the app tracks), as stored in `projects.json` and
+ *  served by `GET /projects`. Mirrors `core::persistence::projects::Project`. */
+export interface Project {
+  id: string;
+  path: string;
+  name: string;
+  color: string;
+  lastOpenedAt?: number;
+}
+
 /**
  * HTTP client for the hyperpanes control API. One instance wraps one discovered
  * `{ port, token }`; create a fresh one per operation so an app restart (new
@@ -247,6 +257,52 @@ export class ControlClient {
   // (interactive-pane-driving plan A2). Same gate as sendInput — it IS input.
   async sendKeys(paneId: string, keys: string[], owner?: string): Promise<void> {
     await this.postInput(paneId, { keys, ...(owner ? { owner } : {}) });
+  }
+
+  // ---- project registry (projects.json) ----
+  // The directories the app remembers (the sidebar rail). Global, not pane-scoped — any
+  // valid token may read/mutate them. A write refreshes the live GUI rail app-side.
+  async listProjects(): Promise<Project[]> {
+    const r = await this.req('/projects');
+    if (r.status === 401) throw new Error('/projects -> 401 unauthorized (stale token? restart bridge)');
+    if (!r.ok) throw new Error(`/projects -> ${r.status}`);
+    const body = (await r.json()) as { projects?: Project[] };
+    return body.projects ?? [];
+  }
+
+  async addProject(dir: string): Promise<{ ok: boolean; added: boolean; project: Project }> {
+    const r = await this.req('/projects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dir })
+    });
+    if (!r.ok) {
+      const b = (await r.json().catch(() => ({}))) as { error?: string };
+      throw new Error(`add project -> ${r.status}${b.error ? ` (${b.error})` : ''}`);
+    }
+    return (await r.json()) as { ok: boolean; added: boolean; project: Project };
+  }
+
+  async patchProject(id: string, patch: { name?: string; color?: string }): Promise<{ ok: boolean }> {
+    const r = await this.req(`/projects/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch)
+    });
+    if (!r.ok) {
+      const b = (await r.json().catch(() => ({}))) as { error?: string };
+      throw new Error(`patch project -> ${r.status}${b.error ? ` (${b.error})` : ''}`);
+    }
+    return (await r.json()) as { ok: boolean };
+  }
+
+  async removeProject(id: string): Promise<{ ok: boolean }> {
+    const r = await this.req(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const b = (await r.json().catch(() => ({}))) as { error?: string };
+      throw new Error(`remove project -> ${r.status}${b.error ? ` (${b.error})` : ''}`);
+    }
+    return (await r.json()) as { ok: boolean };
   }
 
   async command(cmd: ControlCommand): Promise<{ ok: boolean; result?: unknown }> {
