@@ -26,42 +26,60 @@ export type TaskKind = 'ci_failure' | 'lint' | 'issue' | 'review' | 'manual';
 /** Lifecycle state — OWNED by the L2 queue; the controller never writes it. */
 export type TaskState = 'queued' | 'claimed' | 'done' | 'failed' | 'dead';
 
+/** Lifecycle states on the wire — the lowercase strings the Rust queue emits. */
+const TASK_STATES = ['queued', 'claimed', 'done', 'failed', 'dead'] as const;
+
 /**
- * The canonical queue record — EXACTLY the Rust `WorkQueue`'s serialized JSON
- * (camelCase, epoch-ms numbers, flattened lease, optionals omitted). Every field
- * here is queue-owned; the controller reads a claimed Task and reports terminal
- * state via `ack`/`nack` carrying the task's own `fencingToken`. `payload` is the
- * queue-opaque body (a JSON string) — decode it with {@link decodeSpec}.
+ * Runtime schema for the canonical queue record — EXACTLY the Rust `WorkQueue`'s
+ * serialized JSON (camelCase, epoch-ms NUMBER timestamps, FLATTENED lease, optionals
+ * omitted). The Rust serialization (`rs/crates/core/src/control/work.rs`) is
+ * AUTHORITATIVE; this schema mirrors it byte-for-byte and is pinned by the
+ * cross-language golden fixture (`test/fixtures/task-wire.golden.json`). {@link Task}
+ * is inferred from this schema so the type and the runtime validator can't drift.
+ *
+ * `.strict()` so an unexpected key (e.g. a snake_case variant, or a nested `lease`
+ * object) is a HARD parse error — that is the whole point of the contract.
  */
-export interface Task {
-  // ---- identity / columns (the queue owns + assigns) ----
-  id: string; // uuid, queue-assigned, stable across retries — THE join key
-  queue: string; // logical queue / namespace, e.g. "build"
-  seq: number; // global monotonic id; doubles as the list cursor
-  kind: string; // free-form discriminator (ci_failure | lint | issue | review | manual | …)
-  title: string; // short; seeds pane label + PR title
-  state: TaskState;
-  payload: string; // OPAQUE body — JSON string the queue never parses (see TaskSpec)
-  priority: number; // higher first
-  attempts: number; // incremented on each claim
-  maxAttempts: number; // dead-letter once attempts >= maxAttempts
+export const RawTaskSchema = z
+  .object({
+    // ---- identity / columns (the queue owns + assigns) ----
+    id: z.string(), // uuid, queue-assigned, stable across retries — THE join key
+    queue: z.string(), // logical queue / namespace, e.g. "build"
+    seq: z.number(), // global monotonic id; doubles as the list cursor
+    kind: z.string(), // free-form discriminator (ci_failure | lint | issue | review | manual | …)
+    title: z.string(), // short; seeds pane label + PR title
+    state: z.enum(TASK_STATES),
+    payload: z.string(), // OPAQUE body — JSON string the queue never parses (see TaskSpec)
+    priority: z.number(), // higher first
+    attempts: z.number(), // incremented on each claim
+    maxAttempts: z.number(), // dead-letter once attempts >= maxAttempts
 
-  // ---- scheduling ----
-  availableAt: number; // epoch ms; claimable only when availableAt <= now
+    // ---- scheduling ----
+    availableAt: z.number(), // epoch ms; claimable only when availableAt <= now
 
-  // ---- lease (FLATTENED, present only while claimed) ----
-  claimedBy?: string; // worker identity
-  fencingToken?: number; // monotonic fencing token for the current claim
-  visibilityDeadline?: number; // epoch ms; reaped back to queued past this
+    // ---- lease (FLATTENED, present only while claimed) ----
+    claimedBy: z.string().optional(), // worker identity
+    fencingToken: z.number().optional(), // monotonic fencing token for the current claim
+    visibilityDeadline: z.number().optional(), // epoch ms; reaped back to queued past this
 
-  // ---- result / bookkeeping ----
-  result?: string; // recorded on ack
-  error?: string; // recorded on nack / dead-letter
-  dedupeKey?: string; // optional idempotent-enqueue key
+    // ---- result / bookkeeping ----
+    result: z.string().optional(), // recorded on ack
+    error: z.string().optional(), // recorded on nack / dead-letter
+    dedupeKey: z.string().optional(), // optional idempotent-enqueue key
 
-  createdAt: number; // epoch ms
-  updatedAt: number; // epoch ms
-}
+    createdAt: z.number(), // epoch ms
+    updatedAt: z.number() // epoch ms
+  })
+  .strict();
+
+/**
+ * The canonical queue record — inferred from {@link RawTaskSchema} so it stays in
+ * lockstep with the runtime validator. Every field here is queue-owned; the
+ * controller reads a claimed Task and reports terminal state via `ack`/`nack`
+ * carrying the task's own `fencingToken`. `payload` is the queue-opaque body
+ * (a JSON string) — decode it with {@link decodeSpec}.
+ */
+export type Task = z.infer<typeof RawTaskSchema>;
 
 /**
  * The typed instruction the two edges agree on, carried INSIDE the queue-opaque
