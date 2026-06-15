@@ -32,6 +32,13 @@ import {
   type DispatchedTask
 } from './kinds.js';
 import { QueueClient } from './queue-client.js';
+import {
+  reviewDiff,
+  collectWorkerDiff,
+  spawnClaudeReviewRunner,
+  type ReviewRunner,
+  type ReviewResult
+} from './review.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -65,6 +72,15 @@ export interface ControllerConfig {
   workerEntry: string;
   /** Explicit target window; defaults to the first window. */
   windowId?: number;
+  /**
+   * Local LLM-review gate (default ON). When set, a SUCCESS worker's diff is reviewed
+   * with `claude -p` BEFORE the task is acked/finalized; a `block` verdict holds the
+   * merge (the task is nacked `review-blocked`). Disable with `--no-review` for the
+   * unguarded path. The gate FAILS CLOSED — a missing/failed judge blocks.
+   */
+  review: boolean;
+  /** Claude model alias for the review judge (env `HP_REVIEW_MODEL`); default model if unset. */
+  reviewModel?: string;
 }
 
 /** Resolve the built worker entry that sits next to this compiled module. */
@@ -94,6 +110,9 @@ export function defaultConfig(overrides: Partial<ControllerConfig> = {}): Contro
     handshakeDir: env.HP_HANDSHAKE_DIR || join(root, '.handshakes'),
     workerNode: env.HP_WORKER_NODE || 'node',
     workerEntry: env.HP_WORKER_ENTRY || defaultWorkerEntry(),
+    // The review gate is ON by default (HP_REVIEW=0/false opts out); fail-closed.
+    review: !/^(0|false|off|no)$/i.test((env.HP_REVIEW ?? '').trim()),
+    ...(env.HP_REVIEW_MODEL ? { reviewModel: env.HP_REVIEW_MODEL } : {}),
     ...overrides
   };
 }
@@ -179,6 +198,8 @@ export interface TaskRunResult {
   exitCode?: number;
   result?: string | null;
   error?: string;
+  /** The LLM-review verdict, when the gate ran (a SUCCESS worker + `review` on). */
+  review?: ReviewResult;
 }
 
 interface Outcome {
@@ -191,9 +212,21 @@ export class Controller {
   private client!: ControlClient;
   private queue!: QueueClient;
   private readonly git: Git;
+  private readonly reviewRunner: ReviewRunner;
 
-  constructor(private readonly cfg: ControllerConfig) {
+  /**
+   * @param cfg controller configuration.
+   * @param reviewRunner injectable LLM-review judge (the {@link ReviewRunner} seam,
+   *   mirroring the worker's {@link AgentRunner}). Defaults to the real
+   *   {@link spawnClaudeReviewRunner} (`claude -p`); unit tests inject a FAKE so they
+   *   never spawn `claude`.
+   */
+  constructor(
+    private readonly cfg: ControllerConfig,
+    reviewRunner: ReviewRunner = spawnClaudeReviewRunner()
+  ) {
     this.git = new Git(cfg.repo);
+    this.reviewRunner = reviewRunner;
   }
 
   /** Connect to the master control API (control.json) and verify it's live. The same
@@ -312,18 +345,33 @@ export class Controller {
       const resultPath = join(plan.worktree, 'RESULT.md');
       const result = existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : null;
 
-      // 7. report terminal state to the QUEUE (ack on success, nack otherwise)
-      await this.report(task.id, fencingToken, outcome, result);
+      // 6b. LOCAL LLM-REVIEW GATE — runs BETWEEN a SUCCESS worker and the ack/finalize.
+      //     Only a worker that SUCCEEDED is reviewed (a failed/timed-out run is already
+      //     nacked below). The gate FAILS CLOSED: a `block` verdict (or a missing/failed
+      //     judge) flips the outcome to a non-ok `review-blocked`, so `report` NACKS the
+      //     task — the merge never happens. The teardown still discards the worktree.
+      let review: ReviewResult | undefined;
+      let finalOutcome = outcome;
+      if (this.cfg.review && outcome.ok) {
+        review = await this.reviewClaim(plan, spec);
+        if (review.verdict !== 'approve') {
+          finalOutcome = { ok: false, reason: 'review-blocked' };
+        }
+      }
+
+      // 7. report terminal state to the QUEUE (ack on approve/success, nack otherwise)
+      await this.report(task.id, fencingToken, finalOutcome, result);
 
       return {
         id: task.id,
-        ok: outcome.ok,
-        reason: outcome.reason,
+        ok: finalOutcome.ok,
+        reason: finalOutcome.reason,
         paneId,
         branch: plan.branch,
         worktree: plan.worktree,
-        ...(outcome.exitCode != null ? { exitCode: outcome.exitCode } : {}),
-        result
+        ...(finalOutcome.exitCode != null ? { exitCode: finalOutcome.exitCode } : {}),
+        result,
+        ...(review ? { review } : {})
       };
     } catch (err) {
       // best-effort requeue so a crashed run doesn't strand the task as `claimed`
@@ -370,6 +418,30 @@ export class Controller {
     } catch {
       /* lease superseded (409) or queue unreachable — non-fatal */
     }
+  }
+
+  /**
+   * The LLM-review gate for one CLAIMED, SUCCEEDED task: collect the worker's diff
+   * (committed + uncommitted edits on the throwaway branch vs. the base ref) and judge
+   * it with `claude -p` via the injected {@link ReviewRunner}. An EMPTY diff is treated
+   * as nothing-to-merge and approved (the worker changed no files). Otherwise the verdict
+   * is exactly what {@link reviewDiff} returns — and that already FAILS CLOSED to `block`
+   * on a missing/failed/unparseable judge, so this method never throws the gate open.
+   */
+  private async reviewClaim(plan: TaskPlan, spec: TaskSpec): Promise<ReviewResult> {
+    const diff = await collectWorkerDiff(this.cfg.repo, plan.worktree, plan.base);
+    if (!diff.trim()) {
+      return { verdict: 'approve', risk: 0, summary: 'no changes to review (empty diff)' };
+    }
+    return reviewDiff(
+      {
+        diff,
+        title: plan.title,
+        body: spec.prompt,
+        ...(this.cfg.reviewModel ? { model: this.cfg.reviewModel } : {})
+      },
+      this.reviewRunner
+    );
   }
 
   private async openWorkerPane(plan: TaskPlan): Promise<string> {

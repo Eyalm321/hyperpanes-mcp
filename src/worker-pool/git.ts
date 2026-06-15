@@ -56,6 +56,16 @@ export class Git {
     await this.run(['branch', '-D', branch]);
   }
 
+  /**
+   * Return the unified diff for `git -C <repo> diff <args…>` — used by the LLM-review
+   * gate to capture the worker's proposed change (e.g. `diff <base>` from inside a
+   * worktree captures committed work AND any uncommitted edits versus the base ref).
+   */
+  async diff(args: string[]): Promise<string> {
+    const { stdout } = await this.run(['diff', ...args]);
+    return stdout;
+  }
+
   /** Parse `git worktree list --porcelain` into structured records. */
   async worktreeList(): Promise<GitWorktree[]> {
     const { stdout } = await this.run(['worktree', 'list', '--porcelain']);

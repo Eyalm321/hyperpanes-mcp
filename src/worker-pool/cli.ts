@@ -32,7 +32,14 @@ Options:
   --worktree-root <path>   Parent dir for checkouts                 (env HP_WORKTREE_ROOT)
   --timeout-ms <n>         Per-task wall-clock budget               (env HP_TASK_TIMEOUT_MS)
   --window <n>             Target window id (default: first window)
+  --no-review              Skip the local LLM-review merge gate     (env HP_REVIEW=0)
+  --review-model <m>       Claude model alias for the review judge  (env HP_REVIEW_MODEL)
   -h, --help               Show this help
+
+The local LLM-review gate is ON by default: after a worker SUCCEEDS, its diff is
+reviewed with \`claude -p\` (subscription-billed, never the Anthropic API) and the task
+is only acked on an "approve" verdict — a "block" (or a missing/failed judge) holds the
+merge. Pass --no-review to disable it.
 
 A task is { "prompt", "kind"?, "title"?, "priority"?, "base"?, "repo"?, "dedupeKey"? }.
 Only prompt is required; the QUEUE assigns the id. With no --tasks, a built-in sample
@@ -59,6 +66,8 @@ function configFromArgs(values: Record<string, string | boolean | undefined>): C
   if (typeof values.concurrency === 'string') overrides.maxConcurrent = Number(values.concurrency);
   if (typeof values['timeout-ms'] === 'string') overrides.taskTimeoutMs = Number(values['timeout-ms']);
   if (typeof values.window === 'string') overrides.windowId = Number(values.window);
+  if (values['no-review'] === true) overrides.review = false;
+  if (typeof values['review-model'] === 'string') overrides.reviewModel = values['review-model'];
   return defaultConfig(overrides);
 }
 
@@ -100,6 +109,8 @@ async function main(): Promise<void> {
       'worktree-root': { type: 'string' },
       'timeout-ms': { type: 'string' },
       window: { type: 'string' },
+      'no-review': { type: 'boolean' },
+      'review-model': { type: 'string' },
       help: { type: 'boolean', short: 'h' }
     }
   });
@@ -125,8 +136,9 @@ function runDryRun(cfg: ControllerConfig, backlog: EnqueueRequest[]): void {
     const task = syntheticTask(req, cfg.queue, i);
     return planTask(task, decodeSpec(task, cfg.base), cfg);
   });
+  const reviewNote = cfg.review ? `review=on${cfg.reviewModel ? `(${cfg.reviewModel})` : ''}` : 'review=off';
   console.error(
-    `[controller] DRY RUN pool=${cfg.poolId} queue=${cfg.queue} repo=${cfg.repo} tasks=${backlog.length} cap=${cfg.maxConcurrent}`
+    `[controller] DRY RUN pool=${cfg.poolId} queue=${cfg.queue} repo=${cfg.repo} tasks=${backlog.length} cap=${cfg.maxConcurrent} ${reviewNote}`
   );
   console.error(`[controller] worktreeRoot=${cfg.worktreeRoot} worker=${cfg.workerNode} ${cfg.workerEntry}`);
   console.error('[controller] (dry-run ids are placeholders — the live queue assigns a uuid on enqueue)');
@@ -165,7 +177,10 @@ async function runLive(cfg: ControllerConfig, backlog: EnqueueRequest[]): Promis
   console.error(`\n[controller] done: ${ok}/${results.length} succeeded`);
   for (const r of results) {
     const code = r.exitCode != null ? ` code=${r.exitCode}` : '';
-    console.error(` - ${r.id}: ${r.ok ? 'OK' : 'FAIL'} (${r.reason}${code})${r.error ? ` ${r.error}` : ''}`);
+    const verdict = r.review ? ` review=${r.review.verdict}(risk ${r.review.risk}): ${r.review.summary}` : '';
+    console.error(
+      ` - ${r.id}: ${r.ok ? 'OK' : 'FAIL'} (${r.reason}${code})${r.error ? ` ${r.error}` : ''}${verdict}`
+    );
   }
   console.log(JSON.stringify(results, null, 2));
   process.exitCode = ok === results.length ? 0 : 1;
