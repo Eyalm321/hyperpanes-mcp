@@ -283,6 +283,76 @@ export function registerControlTools(server: McpServer): void {
       })
   );
 
+  // ---- spawn_workers ---------------------------------------------------
+  server.registerTool(
+    'spawn_workers',
+    {
+      title: 'Spawn worker pool',
+      description:
+        'Spawn a pool of queue workers in one call (#6). Opens a pane running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` runs that many competing workers inside the one runner; `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo). The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). Returns the spawned pane id.',
+      inputSchema: {
+        queue: z.string().describe('the work queue to drain'),
+        command: z
+          .string()
+          .describe('shell command run per claimed task; reads the task from $HP_TASK_PAYLOAD etc.'),
+        count: z
+          .number()
+          .int()
+          .min(1)
+          .max(64)
+          .optional()
+          .describe('competing workers inside the runner (default 1)'),
+        isolation: z
+          .enum(['none', 'worktree'])
+          .optional()
+          .describe('"worktree" = run each task in a throwaway git worktree (default "none")'),
+        cwd: z
+          .string()
+          .optional()
+          .describe('runner working directory; required (a git repo) for isolation:"worktree"'),
+        color: z.string().optional(),
+        windowId: z.number().int().optional()
+      }
+    },
+    async ({ queue, command, count, isolation, cwd, color, windowId }) =>
+      run(async (c) => {
+        const state = await c.state();
+        const target = windowId ?? firstWindowId(state);
+        if (target == null) throw new Error('no windows open to add a worker pane to');
+        const bin = process.env.HYPERPANES_WORKER_BIN ?? 'hyperpanes';
+        const n = count ?? 1;
+        const args = [
+          'worker',
+          '--queue',
+          queue,
+          '--count',
+          String(n),
+          ...(isolation === 'worktree' ? ['--worktree'] : []),
+          '--',
+          'sh',
+          '-c',
+          command
+        ];
+        const res = await c.command({
+          type: 'newPane',
+          windowId: target,
+          pane: { label: `workers:${queue}`, command: bin, args, cwd, color }
+        });
+        const paneId = typeof res.result === 'string' ? res.result : undefined;
+        if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
+        const ready = await c.waitForPane(paneId);
+        return {
+          ok: true,
+          queue,
+          count: n,
+          isolation: isolation ?? 'none',
+          windowId: target,
+          paneIds: [paneId],
+          ready
+        };
+      })
+  );
+
   // ---- open_tab --------------------------------------------------------
   server.registerTool(
     'open_tab',
