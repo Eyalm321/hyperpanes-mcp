@@ -17,6 +17,7 @@ import {
   type LaunchMode
 } from './launch.js';
 import { registerControlTools } from './control-tools.js';
+import { registerQueueTools } from './queue-tools.js';
 import { writeFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 
@@ -180,6 +181,8 @@ export function createServer(): McpServer {
 
   // ---- Phase 2 (M4): live control over the running app's control API ----
   registerControlTools(server);
+  // ---- work-queue (durable job queue) tools over the control API ----
+  registerQueueTools(server);
 
   return server;
 }

@@ -95,6 +95,25 @@ message bus is hierarchy-agnostic, and tokens scope what a child can reach.
 | `lock_pane` | Take an advisory write lock so only the holder can `send_input` until it expires. |
 | `unlock_pane` | Release an advisory write lock you hold. |
 
+### Work queue
+
+A durable, SQLite-backed **job queue** behind the control server — fan work out to competing
+workers with at-least-once delivery and leases. A `claim` returns each task's `fencingToken`;
+every `ack`/`nack`/`extend` must carry it (lease fencing, so a reaped worker can't clobber a
+task another worker now owns).
+
+| Tool | Description |
+|---|---|
+| `list_queues` | Every queue and its per-state depth. |
+| `enqueue_task` | Append a task (`payload` + optional `kind`/`title`/`priority`/`maxAttempts`/`visibilityTimeoutMs`/`delayMs`/`dedupeKey`). Returns the task `id` + `seq`. |
+| `claim_task` | Claim the next task(s) for a `worker` (competing consumers; empty → `{tasks:[]}`). Each task carries a `fencingToken` + `visibilityDeadline`. |
+| `ack_task` | Complete a claimed task (carry the `fencingToken`). |
+| `nack_task` | Fail a task — re-queued until `maxAttempts`, or `requeue:false` to fail now; `delayMs` backs off. |
+| `extend_task` | Heartbeat a long task: extend its lease so it isn't reaped. |
+| `get_task` | Fetch one task (state, payload, attempts, lease, timestamps). |
+| `list_tasks` | List/inspect a queue's tasks with a `state` filter + `after`/`limit` paging. |
+| `purge_queue` | Drop terminal tasks (done/failed/dead) for cleanup. |
+
 ## Resources
 
 Pane output and inboxes are exposed as **subscribable MCP resources** — read for a snapshot,

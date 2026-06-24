@@ -108,6 +108,19 @@ export class QueueClient {
     return (await r.json()) as EnqueueResult;
   }
 
+  /**
+   * Enqueue with the raw control-API body ({@link https://… payload}, plus any of `kind`, `title`,
+   * `priority`, `maxAttempts`, `visibilityTimeoutMs`, `delayMs`/`availableAt`, `dedupeKey`). The
+   * generic edge used by the MCP `enqueue_task` tool — unlike {@link enqueue}, it doesn't assume the
+   * orchestration's git-task spec.
+   */
+  async enqueueRaw(queue: string, body: Record<string, unknown>): Promise<EnqueueResult> {
+    const r = await this.postJson(`/queues/${encodeURIComponent(queue)}/tasks`, body);
+    if (r.status === 403) throw new Error(`queue out of scope: ${queue}`);
+    if (!r.ok) throw new Error(`enqueue ${queue} -> ${r.status}`);
+    return (await r.json()) as EnqueueResult;
+  }
+
   // ---- competing consumers ----
   /** Claim the next task(s) off `queue` for `worker`; an empty queue yields `[]` (not an error). */
   async claim(queue: string, worker: string, opts: ClaimOpts = {}): Promise<Task[]> {
@@ -177,6 +190,15 @@ export class QueueClient {
     if (!r.ok) throw new Error(`queues -> ${r.status}`);
     const out = (await r.json()) as { queues?: QueueSummary[] };
     return out.queues ?? [];
+  }
+
+  /** Drop TERMINAL tasks (done/failed/dead) from `queue` for retention/cleanup. */
+  async purge(queue: string): Promise<{ removed: number }> {
+    const r = await this.postJson(`/queues/${encodeURIComponent(queue)}/purge`, {});
+    if (r.status === 403) throw new Error(`queue out of scope: ${queue}`);
+    if (!r.ok) throw new Error(`purge ${queue} -> ${r.status}`);
+    const out = (await r.json()) as { removed?: number };
+    return { removed: out.removed ?? 0 };
   }
 
   private async leaseResult(r: Response, op: string, taskId: string): Promise<LeaseResult> {
