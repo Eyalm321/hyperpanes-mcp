@@ -18,6 +18,7 @@ import {
 } from './control/model.js';
 import { checkInputAllowed, readInputGate } from './control/input-gate.js';
 import { PaneSubscriptions } from './control/subscriptions.js';
+import { readPaneTranscript } from './transcript.js';
 
 function json(data: unknown, isError = false) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }], isError };
@@ -181,13 +182,19 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Read pane output',
       description:
-        'Read a pane\'s terminal output. `mode:"screen"` returns the RENDERED cell grid (what\'s actually on screen — no overdraw, spinner spam, or mangled spacing) instead of the raw pty stream; use it to read a TUI agent\'s transcript cleanly (default "raw"). `tail` limits to the last N lines; `strip` removes ANSI escape codes from a raw read. `waitForIdle` BLOCKS until the pane has been output-quiet for `settleMs` (default 600ms) or `timeoutMs` (default 30000ms) elapses — the way to read a reply without polling/sleeping. `since` is a byte cursor (use the `cursor` from a prior read) that returns only NEW output (raw mode), so you don\'t re-scrape the whole scrollback each turn. Every read returns the current `cursor`. For continuous streaming, subscribe to the pane\'s output resource instead.',
+        'Read a pane\'s terminal output. `mode:"transcript"` (Claude panes only) returns the pane\'s actual CONVERSATION — the last `messages` user/assistant turns from the session transcript on disk, joined via the pane\'s session marker — the reliable way to read a claude pane (TUI screen scrapes are lossy). `mode:"screen"` returns the RENDERED cell grid (what\'s actually on screen — no overdraw, spinner spam, or mangled spacing) instead of the raw pty stream. Default "raw". `tail` limits to the last N lines; `strip` removes ANSI escape codes from a raw read. `waitForIdle` BLOCKS until the pane has been output-quiet for `settleMs` (default 600ms) or `timeoutMs` (default 30000ms) elapses — the way to read a reply without polling/sleeping. `since` is a byte cursor (use the `cursor` from a prior read) that returns only NEW output (raw mode), so you don\'t re-scrape the whole scrollback each turn. Every read returns the current `cursor`. For continuous streaming, subscribe to the pane\'s output resource instead.',
       inputSchema: {
         paneId: z.string(),
         mode: z
-          .enum(['raw', 'screen'])
+          .enum(['raw', 'screen', 'transcript'])
           .optional()
-          .describe('"screen" = rendered cell grid (clean TUI transcript); "raw" (default) = pty byte stream'),
+          .describe('"transcript" = the claude pane\'s real conversation tail; "screen" = rendered cell grid; "raw" (default) = pty byte stream'),
+        messages: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('transcript mode: how many trailing conversation messages to return (default 10)'),
         tail: z.number().int().positive().optional(),
         strip: z.boolean().optional(),
         since: z
@@ -214,11 +221,22 @@ export function registerControlTools(server: McpServer): void {
           .describe('max time to block on waitForIdle before returning what is there (default 30000ms)')
       }
     },
-    async ({ paneId, mode, tail, strip, since, waitForIdle, settleMs, timeoutMs }) =>
-      run(async (c) => ({
-        ok: true,
-        ...(await c.readPane(paneId, { mode, tail, strip, since, waitForIdle, settleMs, timeoutMs }))
-      }))
+    async ({ paneId, mode, messages, tail, strip, since, waitForIdle, settleMs, timeoutMs }) =>
+      run(async (c) => {
+        if (mode === 'transcript') {
+          const t = await readPaneTranscript(paneId, { messages });
+          if (!t) {
+            throw new Error(
+              `no Claude session marker for pane ${paneId} — not a claude pane (or its claude predates the session hook); use mode:"screen"`
+            );
+          }
+          return { ok: true, mode: 'transcript', paneId, ...t };
+        }
+        return {
+          ok: true,
+          ...(await c.readPane(paneId, { mode, tail, strip, since, waitForIdle, settleMs, timeoutMs }))
+        };
+      })
   );
 
   // ---- open_pane -------------------------------------------------------
@@ -504,7 +522,73 @@ export function registerControlTools(server: McpServer): void {
 
   paneCommand('focus_pane', 'Focus pane', 'focusPane', 'Focus a pane (and its tab/window).');
   paneCommand('close_pane', 'Close pane', 'closePane', 'Close a pane, terminating its shell.');
-  paneCommand('restart_pane', 'Restart pane', 'restartPane', 'Kill and respawn a pane\'s shell.');
+
+  server.registerTool(
+    'restart_pane',
+    {
+      title: 'Restart pane',
+      description:
+        'Kill and respawn a pane\'s shell. With resume:true, the pane\'s live Claude conversation (per its session marker) is resumed in its own cwd after the respawn — an agent may target its OWN pane to restart itself. `prompt` queues a message typed into the resumed claude the moment it is ready (speak-first); requires resume:true.',
+      inputSchema: {
+        paneId: z.string(),
+        resume: z.boolean().optional().describe('Resume the pane\'s Claude conversation after respawn'),
+        prompt: z.string().optional().describe('Message delivered to the resumed conversation once ready')
+      }
+    },
+    async ({ paneId, resume, prompt }) =>
+      run(async (c) => {
+        await c.command({
+          type: 'restartPane',
+          paneId,
+          ...(resume ? { resume: true } : {}),
+          ...(resume && prompt !== undefined ? { prompt } : {})
+        });
+        return { ok: true, paneId, action: 'restartPane', ...(resume ? { resume: true } : {}) };
+      })
+  );
+
+  // ---- queue_prompt / restart_app (claude-resume: speak-first + phoenix) ----
+  server.registerTool(
+    'queue_prompt',
+    {
+      title: 'Queue prompt for a Claude session',
+      description:
+        'Durably queue a message for a Claude conversation (by session id). It is typed into the owning pane the next time that session is ready — including after a pane restart, an app relaunch, or a reboot. Deliver-once; survives every process involved.',
+      inputSchema: {
+        sessionId: z.string().describe('Claude session id (UUID, e.g. from the pane\'s claude-sessions marker)'),
+        text: z.string().min(1).describe('The message to type when the session (re)appears')
+      }
+    },
+    async ({ sessionId, text }) =>
+      run(async (c) => {
+        await c.command({ type: 'queuePrompt', sessionId, text });
+        return { ok: true, sessionId, queued: true };
+      })
+  );
+
+  server.registerTool(
+    'restart_app',
+    {
+      title: 'Restart hyperpanes',
+      description:
+        'Restart the hyperpanes app itself (root token only). scope:"gui" relaunches the GUI — panes and their processes survive via the session daemon and re-attach. scope:"full" is the phoenix: a final workspace snapshot is flushed, GUI AND daemon exit (every pane dies), and the relaunched app restores the workspace, auto-resuming every pane\'s Claude conversation in its own cwd. Optional sessionId+prompt pre-queues a speak-first message for one resurrected conversation (e.g. the caller\'s own — self-restart across the apocalypse).',
+      inputSchema: {
+        scope: z.enum(['gui', 'full']).describe('"gui": panes survive; "full": everything dies and is restored from the snapshot'),
+        sessionId: z.string().optional().describe('Claude session id to deliver `prompt` to after the restore'),
+        prompt: z.string().optional().describe('Speak-first message for sessionId once it resumes')
+      }
+    },
+    async ({ scope, sessionId, prompt }) =>
+      run(async (c) => {
+        await c.command({
+          type: 'restartApp',
+          scope,
+          ...(sessionId !== undefined ? { sessionId } : {}),
+          ...(prompt !== undefined ? { prompt } : {})
+        });
+        return { ok: true, scope, restarting: true };
+      })
+  );
 
   // ---- rename_pane / recolor_pane (live header edits) ------------------
   server.registerTool(
