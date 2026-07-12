@@ -60,7 +60,7 @@ export function registerQueueTools(server: McpServer): void {
     {
       title: 'Enqueue a task',
       description:
-        'Append a task to a work queue (created on first use). `payload` is the opaque task body (often JSON) a worker reads after claiming. Optional: `kind`/`title` for triage, `priority` (higher runs sooner), `maxAttempts` (auto re-queue up to N on nack/lease-expiry), `visibilityTimeoutMs` (default lease), `delayMs` (schedule into the future), and `dedupeKey` (collapse duplicate enqueues). Returns the new task `id` + `seq`.',
+        'Append a task to a work queue (created on first use). `payload` is the opaque task body (often JSON) a worker reads after claiming. Optional: `kind`/`title` for triage, `priority` (higher runs sooner), `maxAttempts` (auto re-queue up to N on nack/lease-expiry), `visibilityTimeoutMs` (default lease), `delayMs` (schedule into the future), `dedupeKey` (collapse duplicate enqueues), and — for the goals system — `goalId` (tag the task to a goal) and `dependsOn` (task ids that must all reach `done` before this task becomes claimable; a DAG gate). Returns the new task `id` + `seq`.',
       inputSchema: {
         queue: z.string().describe('queue name (created on first enqueue)'),
         payload: z.string().describe('opaque task body the worker reads after claiming (often JSON)'),
@@ -70,10 +70,15 @@ export function registerQueueTools(server: McpServer): void {
         maxAttempts: z.number().int().positive().optional().describe('re-queue up to N times (default 5)'),
         visibilityTimeoutMs: z.number().int().positive().optional().describe('default lease length per claim'),
         delayMs: z.number().int().positive().optional().describe('delay before the task becomes claimable'),
-        dedupeKey: z.string().optional().describe('collapse duplicate enqueues sharing this key')
+        dedupeKey: z.string().optional().describe('collapse duplicate enqueues sharing this key'),
+        goalId: z.string().optional().describe('goals system: tag this task to a goal'),
+        dependsOn: z
+          .array(z.string())
+          .optional()
+          .describe('goals system: task ids that must all be `done` before this task is claimable (DAG gate)')
       }
     },
-    async ({ queue, payload, kind, title, priority, maxAttempts, visibilityTimeoutMs, delayMs, dedupeKey }) =>
+    async ({ queue, payload, kind, title, priority, maxAttempts, visibilityTimeoutMs, delayMs, dedupeKey, goalId, dependsOn }) =>
       run(async (q) =>
         ({
           ...(await q.enqueueRaw(queue, {
@@ -84,7 +89,9 @@ export function registerQueueTools(server: McpServer): void {
             ...(maxAttempts !== undefined ? { maxAttempts } : {}),
             ...(visibilityTimeoutMs !== undefined ? { visibilityTimeoutMs } : {}),
             ...(delayMs !== undefined ? { delayMs } : {}),
-            ...(dedupeKey !== undefined ? { dedupeKey } : {})
+            ...(dedupeKey !== undefined ? { dedupeKey } : {}),
+            ...(goalId !== undefined ? { goalId } : {}),
+            ...(dependsOn !== undefined ? { dependsOn } : {})
           }))
         }))
   );
