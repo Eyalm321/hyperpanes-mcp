@@ -46,9 +46,7 @@ describe('parseTranscript', () => {
     // The pure tool-result user record is plumbing and drops out entirely;
     // tool_use blocks are summarized inline next to the visible text.
     expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant']);
-    expect(msgs[0].text).toBe('hello');
-    expect(msgs[1].text).toBe('hi there');
-    expect(msgs[2].text).toBe('running a tool\n[tool: Bash]');
+    expect(msgs.map((m) => m.text)).toEqual(['hello', 'hi there', 'running a tool\n[tool: Bash]']);
   });
 
   it('returns empty for an empty or garbage transcript', () => {
