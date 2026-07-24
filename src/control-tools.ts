@@ -307,7 +307,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Spawn worker pool',
       description:
-        'Spawn a pool of queue workers in one call (#6). Opens a pane running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` runs that many competing workers inside the one runner; `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo). The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). Returns the spawned pane id.',
+        'Spawn a pool of queue workers in one call (#6). Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). Returns the spawned pane ids.',
       inputSchema: {
         queue: z.string().describe('the work queue to drain'),
         command: z
@@ -319,11 +319,30 @@ export function registerControlTools(server: McpServer): void {
           .min(1)
           .max(64)
           .optional()
-          .describe('competing workers inside the runner (default 1)'),
+          .describe('competing workers (default 1); one pane each unless layout:"single-pane"'),
+        layout: z
+          .enum(['pane-per-worker', 'single-pane'])
+          .optional()
+          .describe('"pane-per-worker" (default) = one visible pane per worker; "single-pane" = one runner pane multiplexing all N'),
         isolation: z
           .enum(['none', 'worktree'])
           .optional()
           .describe('"worktree" = run each task in a throwaway git worktree (default "none")'),
+        stream: z
+          .boolean()
+          .optional()
+          .describe('render the child\'s Claude stream-json events as readable progress (pair with `--output-format stream-json --verbose` in `command`)'),
+        logDir: z
+          .string()
+          .optional()
+          .describe('tee each task\'s raw output to <dir>/<queue>-<taskId>.log, so the transcript survives the pane closing'),
+        lingerSecs: z
+          .number()
+          .int()
+          .min(0)
+          .max(3600)
+          .optional()
+          .describe('hold each worker pane open this many seconds after the queue drains (default 0 = close immediately)'),
         cwd: z
           .string()
           .optional()
@@ -332,40 +351,59 @@ export function registerControlTools(server: McpServer): void {
         windowId: z.number().int().optional()
       }
     },
-    async ({ queue, command, count, isolation, cwd, color, windowId }) =>
+    async ({ queue, command, count, layout, isolation, stream, logDir, lingerSecs, cwd, color, windowId }) =>
       run(async (c) => {
         const state = await c.state();
         const target = windowId ?? firstWindowId(state);
         if (target == null) throw new Error('no windows open to add a worker pane to');
         const bin = process.env.HYPERPANES_WORKER_BIN ?? 'hyperpanes';
         const n = count ?? 1;
-        const args = [
+        // One pane per worker by default: N agents multiplexed into a single pane interleave
+        // their output and read as "nothing is happening".
+        const perPane = (layout ?? 'pane-per-worker') === 'pane-per-worker';
+        const panes = perPane ? n : 1;
+        const workersPerPane = perPane ? 1 : n;
+        const argsFor = (i: number) => [
           'worker',
           '--queue',
           queue,
           '--count',
-          String(n),
+          String(workersPerPane),
+          ...(perPane && n > 1 ? ['--worker', `w${i + 1}`] : []),
           ...(isolation === 'worktree' ? ['--worktree'] : []),
+          ...(stream ? ['--stream'] : []),
+          ...(logDir ? ['--log-dir', logDir] : []),
+          ...(lingerSecs ? ['--linger', String(lingerSecs)] : []),
           '--',
           'sh',
           '-c',
           command
         ];
-        const res = await c.command({
-          type: 'newPane',
-          windowId: target,
-          pane: { label: `workers:${queue}`, command: bin, args, cwd, color }
-        });
-        const paneId = typeof res.result === 'string' ? res.result : undefined;
-        if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
-        const ready = await c.waitForPane(paneId);
+        const paneIds: string[] = [];
+        for (let i = 0; i < panes; i++) {
+          const label = panes > 1 ? `workers:${queue}#${i + 1}` : `workers:${queue}`;
+          const res = await c.command({
+            type: 'newPane',
+            windowId: target,
+            pane: { label, command: bin, args: argsFor(i), cwd, color }
+          });
+          const paneId = typeof res.result === 'string' ? res.result : undefined;
+          if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
+          paneIds.push(paneId);
+        }
+        const first = paneIds[0];
+        if (!first) throw new Error('no worker panes were spawned');
+        const ready = await c.waitForPane(first);
         return {
           ok: true,
           queue,
           count: n,
+          layout: perPane ? 'pane-per-worker' : 'single-pane',
           isolation: isolation ?? 'none',
+          stream: stream ?? false,
+          logDir: logDir ?? null,
           windowId: target,
-          paneIds: [paneId],
+          paneIds,
           ready
         };
       })
