@@ -311,7 +311,8 @@ export function registerControlTools(server: McpServer): void {
  * `pane-per-worker`, worker pane `i` round-robins through the account list — each
  * pane is its own process, so each gets its own CLAUDE_CONFIG_DIR. Under
  * `single-pane`, one runner process multiplexes all N workers, so there is no
- * per-worker slot to rotate into — it gets `accounts[0]`.
+ * per-worker slot to rotate into — `validateAccountsRotation` rejects that combination
+ * for count > 1; a single worker (count 1) legitimately gets `accounts[0]`.
  */
 export function workerAccountEnv(
   i: number,
@@ -321,6 +322,21 @@ export function workerAccountEnv(
   if (!accounts || accounts.length === 0) return undefined;
   const idx = perPane ? i % accounts.length : 0;
   return { CLAUDE_CONFIG_DIR: accounts[idx] as string };
+}
+
+/** Reject `accounts` rotation that cannot actually rotate: layout:"single-pane" runs all N
+ * workers in ONE pane process, and pane env is per-process — every worker would share one
+ * CLAUDE_CONFIG_DIR while the caller believes they are rotating. Fail loudly instead. */
+export function validateAccountsRotation(
+  perPane: boolean,
+  count: number,
+  accounts: string[] | undefined
+): void {
+  if (accounts && accounts.length > 0 && !perPane && count > 1) {
+    throw new Error(
+      'accounts rotation requires layout:"pane-per-worker"; layout:"single-pane" shares one process env across all workers, so per-worker CLAUDE_CONFIG_DIR rotation is impossible'
+    );
+  }
 }
 
 /** Merge `env` with the account-rotation env for pane `i`; omitted (undefined) when empty, so
@@ -335,16 +351,22 @@ export function workerPaneEnv(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-/** Org metadata for a spawned worker pane: `parent` defaults to this bridge's own
- * pane id (so a manager's workers are attributed to it), but an explicit
- * `meta.parent` (or any other explicit key) always wins. Omitted (undefined) when
- * empty, so existing pane specs with no `meta` and no HYPERPANES_PANE_ID are unchanged. */
+/** Org metadata for a spawned worker pane. Every worker pane is stamped with default
+ * org meta — role="worker", task="queue:<queue>", and `parent` = this bridge's own
+ * pane id (so a manager's workers are attributed to it and their send_to_parent works
+ * out of the box; parent is omitted when HYPERPANES_PANE_ID is unset). Caller `meta`
+ * merges OVER the defaults — an explicit key always wins. */
 export function workerPaneMeta(
   meta: Record<string, string> | undefined,
-  parentPaneId: string | undefined
-): Record<string, string> | undefined {
-  const merged = { ...(parentPaneId ? { parent: parentPaneId } : {}), ...(meta ?? {}) };
-  return Object.keys(merged).length > 0 ? merged : undefined;
+  parentPaneId: string | undefined,
+  queue: string
+): Record<string, string> {
+  return {
+    role: 'worker',
+    task: `queue:${queue}`,
+    ...(parentPaneId ? { parent: parentPaneId } : {}),
+    ...(meta ?? {})
+  };
 }
 
 function registerSpawnWorkers(server: McpServer): void {
@@ -353,7 +375,7 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Spawn worker pool',
       description:
-        'Spawn a pool of queue workers in one call (#6). Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). Returns the spawned pane ids.',
+        'Spawn a pool of queue workers in one call (#6). Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). `env`/`accounts`/`meta`/`project`/`subtitle` pass through to each worker pane spec — merge order: `env` is the shared base, `accounts[i % len]` sets each pane\'s CLAUDE_CONFIG_DIR and wins over `env` (rotation requires `layout:"pane-per-worker"` when count > 1; single-pane shares one process env, so the call fails loudly). Every worker pane is stamped with default org meta role="worker", task="queue:<queue>", parent=<this bridge\'s pane> (so worker send_to_parent works out of the box); caller `meta` wins over those defaults. Returns the spawned pane ids.',
       inputSchema: {
         queue: z.string().describe('the work queue to drain'),
         command: z
@@ -399,13 +421,13 @@ function registerSpawnWorkers(server: McpServer): void {
           .array(z.string())
           .optional()
           .describe(
-            'CLAUDE_CONFIG_DIR account rotation: under layout:"pane-per-worker" (default), worker pane i gets env.CLAUDE_CONFIG_DIR = accounts[i % accounts.length]; layout:"single-pane" multiplexes all N workers in one process, so it gets accounts[0]'
+            'CLAUDE_CONFIG_DIR account rotation: under layout:"pane-per-worker" (default), worker pane i gets env.CLAUDE_CONFIG_DIR = accounts[i % accounts.length], winning over env.CLAUDE_CONFIG_DIR. Rotation needs one pane per worker: with layout:"single-pane" and count > 1 the call FAILS (one process env cannot rotate per-worker); single-pane with count 1 gets accounts[0]'
           ),
         meta: z
           .record(z.string(), z.string())
           .optional()
           .describe(
-            'free-form org metadata set on every worker pane (reserved keys role/parent/agentType/task); meta.parent defaults to this bridge\'s HYPERPANES_PANE_ID unless set explicitly'
+            'free-form org metadata merged OVER the stamped defaults (role="worker", task="queue:<queue>", parent=<this bridge\'s HYPERPANES_PANE_ID>) — an explicit key always wins'
           ),
         project: z
           .string()
@@ -460,7 +482,8 @@ function registerSpawnWorkers(server: McpServer): void {
           '-c',
           command
         ];
-        const paneMeta = workerPaneMeta(meta, process.env.HYPERPANES_PANE_ID);
+        validateAccountsRotation(perPane, n, accounts);
+        const paneMeta = workerPaneMeta(meta, process.env.HYPERPANES_PANE_ID, queue);
         const paneIds: string[] = [];
         for (let i = 0; i < panes; i++) {
           const label = panes > 1 ? `workers:${queue}#${i + 1}` : `workers:${queue}`;
@@ -475,7 +498,7 @@ function registerSpawnWorkers(server: McpServer): void {
               cwd,
               color,
               ...(paneEnv ? { env: paneEnv } : {}),
-              ...(paneMeta ? { meta: paneMeta } : {}),
+              meta: paneMeta,
               ...(project !== undefined ? { project } : {}),
               ...(subtitle !== undefined ? { subtitle } : {})
             }

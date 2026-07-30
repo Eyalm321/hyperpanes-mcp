@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { createServer } from './server.js';
-import { workerAccountEnv, workerPaneEnv, workerPaneMeta } from './control-tools.js';
+import {
+  workerAccountEnv,
+  workerPaneEnv,
+  workerPaneMeta,
+  validateAccountsRotation
+} from './control-tools.js';
 
 // The spawn_workers tool must stay registered (regression guard for the #6 worker-pool
 // surface: a dropped registration or rename silently removes one-call pool spawning).
@@ -24,10 +29,21 @@ describe('workerAccountEnv / workerPaneEnv', () => {
     expect(workerAccountEnv(2, true, accounts)).toEqual({ CLAUDE_CONFIG_DIR: '/accts/a' });
   });
 
-  it('single-pane layout always gets accounts[0] (one process, no per-worker slot)', () => {
+  it('single-pane with a single worker gets accounts[0] (count > 1 is rejected before this)', () => {
     expect(workerAccountEnv(0, false, accounts)).toEqual({ CLAUDE_CONFIG_DIR: '/accts/a' });
-    // Even if called with a nonzero index, single-pane has only pane i=0 anyway.
-    expect(workerAccountEnv(2, false, accounts)).toEqual({ CLAUDE_CONFIG_DIR: '/accts/a' });
+  });
+
+  it('rejects accounts rotation under single-pane with count > 1 (one process env cannot rotate)', () => {
+    expect(() => validateAccountsRotation(false, 2, accounts)).toThrow(
+      /accounts rotation requires layout:"pane-per-worker"/
+    );
+  });
+
+  it('allows accounts under single-pane with count 1, any pane-per-worker count, or no accounts', () => {
+    expect(() => validateAccountsRotation(false, 1, accounts)).not.toThrow();
+    expect(() => validateAccountsRotation(true, 5, accounts)).not.toThrow();
+    expect(() => validateAccountsRotation(false, 5, undefined)).not.toThrow();
+    expect(() => validateAccountsRotation(false, 5, [])).not.toThrow();
   });
 
   it('is undefined when no accounts are given', () => {
@@ -47,27 +63,33 @@ describe('workerAccountEnv / workerPaneEnv', () => {
   });
 });
 
-// Org metadata (meta.parent default + explicit override) for spawn_workers({ meta }).
+// Org metadata (stamped defaults + caller override) for spawn_workers({ meta }).
 describe('workerPaneMeta', () => {
-  it('defaults meta.parent to the caller pane id when meta omits it', () => {
-    expect(workerPaneMeta(undefined, 'pane-123')).toEqual({ parent: 'pane-123' });
+  it('stamps default org meta role/task and defaults parent to the caller pane id', () => {
+    expect(workerPaneMeta(undefined, 'pane-123', 'q1')).toEqual({
+      role: 'worker',
+      task: 'queue:q1',
+      parent: 'pane-123'
+    });
   });
 
-  it('passes through arbitrary org keys like role/task', () => {
-    expect(workerPaneMeta({ role: 'reviewer', task: 'T1' }, 'pane-123')).toEqual({
+  it('caller meta merges OVER the defaults (explicit role/task/parent win)', () => {
+    expect(workerPaneMeta({ role: 'reviewer', task: 'T1' }, 'pane-123', 'q1')).toEqual({
       parent: 'pane-123',
       role: 'reviewer',
       task: 'T1'
     });
-  });
-
-  it('an explicit meta.parent overrides the HYPERPANES_PANE_ID default', () => {
-    expect(workerPaneMeta({ parent: 'explicit-parent' }, 'pane-123')).toEqual({
+    expect(workerPaneMeta({ parent: 'explicit-parent' }, 'pane-123', 'q1')).toEqual({
+      role: 'worker',
+      task: 'queue:q1',
       parent: 'explicit-parent'
     });
   });
 
-  it('produces no meta key at all when neither meta nor a caller pane id are given', () => {
-    expect(workerPaneMeta(undefined, undefined)).toBeUndefined();
+  it('omits parent (but still stamps role/task) when HYPERPANES_PANE_ID is unset', () => {
+    expect(workerPaneMeta(undefined, undefined, 'q1')).toEqual({
+      role: 'worker',
+      task: 'queue:q1'
+    });
   });
 });
