@@ -302,6 +302,52 @@ export function registerControlTools(server: McpServer): void {
   );
 
   // ---- spawn_workers ---------------------------------------------------
+
+  registerSpawnWorkers(server);
+}
+
+/**
+ * CLAUDE_CONFIG_DIR account rotation for spawn_workers (`accounts`). Under
+ * `pane-per-worker`, worker pane `i` round-robins through the account list — each
+ * pane is its own process, so each gets its own CLAUDE_CONFIG_DIR. Under
+ * `single-pane`, one runner process multiplexes all N workers, so there is no
+ * per-worker slot to rotate into — it gets `accounts[0]`.
+ */
+export function workerAccountEnv(
+  i: number,
+  perPane: boolean,
+  accounts: string[] | undefined
+): Record<string, string> | undefined {
+  if (!accounts || accounts.length === 0) return undefined;
+  const idx = perPane ? i % accounts.length : 0;
+  return { CLAUDE_CONFIG_DIR: accounts[idx] as string };
+}
+
+/** Merge `env` with the account-rotation env for pane `i`; omitted (undefined) when empty, so
+ * existing pane specs with neither `env` nor `accounts` are unchanged. */
+export function workerPaneEnv(
+  i: number,
+  perPane: boolean,
+  env: Record<string, string> | undefined,
+  accounts: string[] | undefined
+): Record<string, string> | undefined {
+  const merged = { ...(env ?? {}), ...(workerAccountEnv(i, perPane, accounts) ?? {}) };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/** Org metadata for a spawned worker pane: `parent` defaults to this bridge's own
+ * pane id (so a manager's workers are attributed to it), but an explicit
+ * `meta.parent` (or any other explicit key) always wins. Omitted (undefined) when
+ * empty, so existing pane specs with no `meta` and no HYPERPANES_PANE_ID are unchanged. */
+export function workerPaneMeta(
+  meta: Record<string, string> | undefined,
+  parentPaneId: string | undefined
+): Record<string, string> | undefined {
+  const merged = { ...(parentPaneId ? { parent: parentPaneId } : {}), ...(meta ?? {}) };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function registerSpawnWorkers(server: McpServer): void {
   server.registerTool(
     'spawn_workers',
     {
@@ -348,10 +394,45 @@ export function registerControlTools(server: McpServer): void {
           .optional()
           .describe('runner working directory; required (a git repo) for isolation:"worktree"'),
         color: z.string().optional(),
+        env: z.record(z.string(), z.string()).optional().describe('env vars set on every worker pane'),
+        accounts: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'CLAUDE_CONFIG_DIR account rotation: under layout:"pane-per-worker" (default), worker pane i gets env.CLAUDE_CONFIG_DIR = accounts[i % accounts.length]; layout:"single-pane" multiplexes all N workers in one process, so it gets accounts[0]'
+          ),
+        meta: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe(
+            'free-form org metadata set on every worker pane (reserved keys role/parent/agentType/task); meta.parent defaults to this bridge\'s HYPERPANES_PANE_ID unless set explicitly'
+          ),
+        project: z
+          .string()
+          .optional()
+          .describe('open worker panes in a remembered project (see list_projects): defaults cwd + color from it'),
+        subtitle: z.string().optional().describe('secondary header line set on every worker pane'),
         windowId: z.number().int().optional()
       }
     },
-    async ({ queue, command, count, layout, isolation, stream, logDir, lingerSecs, cwd, color, windowId }) =>
+    async ({
+      queue,
+      command,
+      count,
+      layout,
+      isolation,
+      stream,
+      logDir,
+      lingerSecs,
+      cwd,
+      color,
+      env,
+      accounts,
+      meta,
+      project,
+      subtitle,
+      windowId
+    }) =>
       run(async (c) => {
         const state = await c.state();
         const target = windowId ?? firstWindowId(state);
@@ -379,13 +460,25 @@ export function registerControlTools(server: McpServer): void {
           '-c',
           command
         ];
+        const paneMeta = workerPaneMeta(meta, process.env.HYPERPANES_PANE_ID);
         const paneIds: string[] = [];
         for (let i = 0; i < panes; i++) {
           const label = panes > 1 ? `workers:${queue}#${i + 1}` : `workers:${queue}`;
+          const paneEnv = workerPaneEnv(i, perPane, env, accounts);
           const res = await c.command({
             type: 'newPane',
             windowId: target,
-            pane: { label, command: bin, args: argsFor(i), cwd, color }
+            pane: {
+              label,
+              command: bin,
+              args: argsFor(i),
+              cwd,
+              color,
+              ...(paneEnv ? { env: paneEnv } : {}),
+              ...(paneMeta ? { meta: paneMeta } : {}),
+              ...(project !== undefined ? { project } : {}),
+              ...(subtitle !== undefined ? { subtitle } : {})
+            }
           });
           const paneId = typeof res.result === 'string' ? res.result : undefined;
           if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
