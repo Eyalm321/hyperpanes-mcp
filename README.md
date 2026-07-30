@@ -53,6 +53,16 @@ It works at two levels, and you can use either without the other:
 | `rename_pane` | Change a pane's label and (optionally) subtitle, live. |
 | `recolor_pane` | Change a pane's frame color, live (any CSS color). |
 | `set_meta` | Attach/update a pane's free-form metadata (merge; `null` deletes a key). How an orchestrator records the org chart as data. |
+| `set_talk` | Turn per-pane talk on/off — while enabled, the pane speaks NEW Claude assistant replies aloud via local TTS. Off by default. |
+
+### Speech (TTS)
+
+Global controls over the app's text-to-speech output (talk is opted into per-pane via `set_talk` above).
+
+| Tool | Description |
+|---|---|
+| `set_speech` | Set global speech settings: `muted` mutes/unmutes all speech, `focusedOnly` restricts speaking to the focused pane. Provide at least one. |
+| `stop_speech` | Immediately kill any in-flight speech utterance and clear the backlog. |
 
 ### Send input
 

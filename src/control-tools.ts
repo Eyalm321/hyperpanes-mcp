@@ -803,6 +803,69 @@ export function registerControlTools(server: McpServer): void {
       })
   );
 
+  // ---- set_talk / set_speech / stop_speech (per-pane + global TTS) ------
+  server.registerTool(
+    'set_talk',
+    {
+      title: 'Set pane talk',
+      description:
+        'Turn per-pane talk on/off: while enabled, the pane speaks NEW Claude assistant replies aloud via local TTS. Off by default. Returns the resolved talk state and TTS backend (plus a warning if the backend has a problem, e.g. missing binary).',
+      inputSchema: {
+        paneId: z.string(),
+        enabled: z.boolean()
+      }
+    },
+    async ({ paneId, enabled }) =>
+      run(async (c) => {
+        const res = await c.command({ type: 'setTalk', paneId, enabled });
+        const result = (res.result ?? {}) as { talk?: boolean; backend?: string; warning?: string };
+        return { ok: true, paneId, ...result };
+      })
+  );
+
+  server.registerTool(
+    'set_speech',
+    {
+      title: 'Set global speech settings',
+      description:
+        'Set global speech (TTS) settings: `muted` mutes/unmutes all speech output; `focusedOnly` restricts speaking to the currently focused pane. Provide at least one of the two.',
+      inputSchema: {
+        muted: z.boolean().optional().describe('Mute (true) or unmute (false) all speech output'),
+        focusedOnly: z
+          .boolean()
+          .optional()
+          .describe('Speak only for the focused pane (true), or any talk-enabled pane (false)')
+      }
+    },
+    async ({ muted, focusedOnly }) =>
+      run(async (c) => {
+        if (muted === undefined && focusedOnly === undefined) {
+          return { ok: false, error: 'set_speech requires at least one of muted/focusedOnly' };
+        }
+        if (muted !== undefined) await c.command({ type: 'setSpeechMuted', muted });
+        if (focusedOnly !== undefined) await c.command({ type: 'setSpeechFocusedOnly', focusedOnly });
+        return {
+          ok: true,
+          ...(muted !== undefined ? { muted } : {}),
+          ...(focusedOnly !== undefined ? { focusedOnly } : {})
+        };
+      })
+  );
+
+  server.registerTool(
+    'stop_speech',
+    {
+      title: 'Stop speech',
+      description:
+        'Immediately kill any in-flight speech utterance and clear the speech backlog (global one-shot).'
+    },
+    async () =>
+      run(async (c) => {
+        await c.command({ type: 'stopSpeech' });
+        return { ok: true, stopped: true };
+      })
+  );
+
   registerMessagingTools(server);
   registerScopeAndLockTools(server);
 
