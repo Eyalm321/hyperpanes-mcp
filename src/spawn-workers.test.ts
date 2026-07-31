@@ -4,6 +4,7 @@ import {
   workerAccountEnv,
   workerPaneEnv,
   workerPaneMeta,
+  workerRunnerArgs,
   validateAccountsRotation
 } from './control-tools.js';
 
@@ -91,5 +92,79 @@ describe('workerPaneMeta', () => {
       role: 'worker',
       task: 'queue:q1'
     });
+  });
+});
+
+// Runner argv construction for spawn_workers — workerRunnerArgs IS the args array each worker
+// pane's newPane gets, so these assertions cover the emitted argv (including the #g5 contract:
+// isolation:"worktree" always carries an explicit --base fork point).
+describe('workerRunnerArgs', () => {
+  const opts = { queue: 'q1', command: 'do-it', workersPerPane: 1, perPane: true, count: 1 };
+
+  it('worktree isolation forwards the fork point as --worktree --base <committish>', () => {
+    expect(workerRunnerArgs({ ...opts, isolation: 'worktree' as const, base: 'main' }, 0)).toEqual([
+      'worker',
+      '--queue',
+      'q1',
+      '--count',
+      '1',
+      '--worktree',
+      '--base',
+      'main',
+      '--',
+      'sh',
+      '-c',
+      'do-it'
+    ]);
+  });
+
+  it('rejects isolation:"worktree" without base (runner would die on parse AFTER the call returned ok)', () => {
+    expect(() => workerRunnerArgs({ ...opts, isolation: 'worktree' as const }, 0)).toThrow(
+      /isolation:"worktree" requires base/
+    );
+  });
+
+  it('emits neither --worktree nor --base without worktree isolation', () => {
+    const argv = workerRunnerArgs(opts, 0);
+    expect(argv).not.toContain('--worktree');
+    expect(argv).not.toContain('--base');
+    expect(argv).toEqual(['worker', '--queue', 'q1', '--count', '1', '--', 'sh', '-c', 'do-it']);
+  });
+
+  it('keeps --base in the full flag set the runner parses (pane i=1 of 3, stream/logDir/linger)', () => {
+    expect(
+      workerRunnerArgs(
+        {
+          ...opts,
+          count: 3,
+          isolation: 'worktree' as const,
+          base: 'g7/integration',
+          stream: true,
+          logDir: '/logs',
+          lingerSecs: 120
+        },
+        1
+      )
+    ).toEqual([
+      'worker',
+      '--queue',
+      'q1',
+      '--count',
+      '1',
+      '--worker',
+      'w2',
+      '--worktree',
+      '--base',
+      'g7/integration',
+      '--stream',
+      '--log-dir',
+      '/logs',
+      '--linger',
+      '120',
+      '--',
+      'sh',
+      '-c',
+      'do-it'
+    ]);
   });
 });

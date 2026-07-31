@@ -369,13 +369,62 @@ export function workerPaneMeta(
   };
 }
 
+/**
+ * Runner argv for worker pane `i` of a spawn_workers call — the exact `args` its newPane gets.
+ * Extracted (and exported) so tests can assert that argv directly. `isolation:"worktree"` must
+ * carry an explicit `--base` fork point: the runner hard-requires it (hyperpanes
+ * docs/worker-worktree-base.md — the implicit runner-cwd-HEAD fork silently cross-contaminated
+ * concurrent goals), and without this guard the tool would return ok while every worker pane
+ * died on the runner's parse error.
+ */
+export function workerRunnerArgs(
+  opts: {
+    queue: string;
+    command: string;
+    workersPerPane: number;
+    perPane: boolean;
+    count: number;
+    isolation?: 'none' | 'worktree';
+    base?: string;
+    stream?: boolean;
+    logDir?: string;
+    lingerSecs?: number;
+  },
+  i: number
+): string[] {
+  const { queue, command, workersPerPane, perPane, count, isolation, base, stream, logDir, lingerSecs } =
+    opts;
+  if (isolation === 'worktree' && !base) {
+    throw new Error(
+      'isolation:"worktree" requires base — the fork point must be explicit (e.g. base:"main", or the goal\'s integration branch for a dependent wave)'
+    );
+  }
+  return [
+    'worker',
+    '--queue',
+    queue,
+    '--count',
+    String(workersPerPane),
+    ...(perPane && count > 1 ? ['--worker', `w${i + 1}`] : []),
+    ...(isolation === 'worktree' ? ['--worktree'] : []),
+    ...(base ? ['--base', base] : []),
+    ...(stream ? ['--stream'] : []),
+    ...(logDir ? ['--log-dir', logDir] : []),
+    ...(lingerSecs ? ['--linger', String(lingerSecs)] : []),
+    '--',
+    'sh',
+    '-c',
+    command
+  ];
+}
+
 function registerSpawnWorkers(server: McpServer): void {
   server.registerTool(
     'spawn_workers',
     {
       title: 'Spawn worker pool',
       description:
-        'Spawn a pool of queue workers in one call (#6). Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). `env`/`accounts`/`meta`/`project`/`subtitle` pass through to each worker pane spec — merge order: `env` is the shared base, `accounts[i % len]` sets each pane\'s CLAUDE_CONFIG_DIR and wins over `env` (rotation requires `layout:"pane-per-worker"` when count > 1; single-pane shares one process env, so the call fails loudly). Every worker pane is stamped with default org meta role="worker", task="queue:<queue>", parent=<this bridge\'s pane> (so worker send_to_parent works out of the box); caller `meta` wins over those defaults. Returns the spawned pane ids.',
+        'Spawn a pool of queue workers in one call (#6). Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo) and REQUIRES `base` — the explicit committish each task worktree forks from, passed to the runner as `--base` (the call fails without it). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). `env`/`accounts`/`meta`/`project`/`subtitle` pass through to each worker pane spec — merge order: `env` is the shared base, `accounts[i % len]` sets each pane\'s CLAUDE_CONFIG_DIR and wins over `env` (rotation requires `layout:"pane-per-worker"` when count > 1; single-pane shares one process env, so the call fails loudly). Every worker pane is stamped with default org meta role="worker", task="queue:<queue>", parent=<this bridge\'s pane> (so worker send_to_parent works out of the box); caller `meta` wins over those defaults. Returns the spawned pane ids.',
       inputSchema: {
         queue: z.string().describe('the work queue to drain'),
         command: z
@@ -395,7 +444,13 @@ function registerSpawnWorkers(server: McpServer): void {
         isolation: z
           .enum(['none', 'worktree'])
           .optional()
-          .describe('"worktree" = run each task in a throwaway git worktree (default "none")'),
+          .describe('"worktree" = run each task in a throwaway git worktree (default "none"); requires `base`'),
+        base: z
+          .string()
+          .optional()
+          .describe(
+            'fork point committish for isolation:"worktree" task worktrees (REQUIRED with it): "main" for independent work, the goal\'s integration branch for a dependent wave'
+          ),
         stream: z
           .boolean()
           .optional()
@@ -443,6 +498,7 @@ function registerSpawnWorkers(server: McpServer): void {
       count,
       layout,
       isolation,
+      base,
       stream,
       logDir,
       lingerSecs,
@@ -466,22 +522,11 @@ function registerSpawnWorkers(server: McpServer): void {
         const perPane = (layout ?? 'pane-per-worker') === 'pane-per-worker';
         const panes = perPane ? n : 1;
         const workersPerPane = perPane ? 1 : n;
-        const argsFor = (i: number) => [
-          'worker',
-          '--queue',
-          queue,
-          '--count',
-          String(workersPerPane),
-          ...(perPane && n > 1 ? ['--worker', `w${i + 1}`] : []),
-          ...(isolation === 'worktree' ? ['--worktree'] : []),
-          ...(stream ? ['--stream'] : []),
-          ...(logDir ? ['--log-dir', logDir] : []),
-          ...(lingerSecs ? ['--linger', String(lingerSecs)] : []),
-          '--',
-          'sh',
-          '-c',
-          command
-        ];
+        const argsFor = (i: number) =>
+          workerRunnerArgs(
+            { queue, command, workersPerPane, perPane, count: n, isolation, base, stream, logDir, lingerSecs },
+            i
+          );
         validateAccountsRotation(perPane, n, accounts);
         const paneMeta = workerPaneMeta(meta, process.env.HYPERPANES_PANE_ID, queue);
         const paneIds: string[] = [];
