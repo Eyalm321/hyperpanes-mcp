@@ -110,8 +110,16 @@ export function registerQueueTools(server: McpServer): void {
         count: z.number().int().positive().optional().describe('prefetch up to N tasks (default 1)')
       }
     },
+    // holderPid = this bridge's pid. The bridge lives exactly as long as the agent session
+    // that owns it (it exits when the agent's stdio closes), and it survives a GUI relaunch
+    // with the agent, so the app's boot recovery keeps the agent's claim instead of
+    // requeueing it. The bridge re-reads control.json on every call, so the agent's later
+    // ack_task reaches the relaunched app (new port + token) with the same fencing token.
     async ({ queue, worker, leaseMs, count }) =>
-      run(async (q) => ({ ok: true, tasks: await q.claim(queue, worker, { leaseMs, count }) }))
+      run(async (q) => ({
+        ok: true,
+        tasks: await q.claim(queue, worker, { leaseMs, count, holderPid: process.pid })
+      }))
   );
 
   // ---- ack_task --------------------------------------------------------

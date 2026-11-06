@@ -54,6 +54,13 @@ export interface ClaimOpts {
   leaseMs?: number;
   /** Prefetch up to N tasks in one call (default 1). */
   count?: number;
+  /**
+   * Pid of the process holding the claim (normally the caller's own `process.pid`). The app
+   * records it when it is a live local process, and boot recovery then keeps this claim
+   * (same fencing token) across a GUI relaunch for as long as that process lives, instead of
+   * requeueing it as orphaned. Omit it and the claim is requeued on the app's next boot.
+   */
+  holderPid?: number;
 }
 
 export interface NackOpts {
@@ -127,7 +134,8 @@ export class QueueClient {
     const body = {
       worker,
       ...(opts.leaseMs !== undefined ? { leaseMs: opts.leaseMs } : {}),
-      ...(opts.count !== undefined ? { count: opts.count } : {})
+      ...(opts.count !== undefined ? { count: opts.count } : {}),
+      ...(opts.holderPid !== undefined ? { holderPid: opts.holderPid } : {})
     };
     const r = await this.postJson(`/queues/${encodeURIComponent(queue)}/claim`, body);
     if (r.status === 403) throw new Error(`queue out of scope: ${queue}`);
