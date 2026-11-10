@@ -219,7 +219,9 @@ export class FetchGitHubClient implements GitHubClient {
         await this.#sleep(1000 * 2 ** (attempt - 1));
         continue;
       }
-      if (res.status === 404 || res.status === 422) return { status: res.status, data: null, link: null };
+      // A 404 on a read is a meaningful answer (no permission row, no such label); callers decide.
+      // A failed write must never look like success, or the sync would think it had posted.
+      if (res.status === 404 && method === 'GET') return { status: res.status, data: null, link: null };
       if (!res.ok) throw new GitHubApiError(res.status, method, path);
       const text = await res.text();
       const data = text ? (JSON.parse(text) as unknown) : null;
@@ -249,6 +251,7 @@ export class FetchGitHubClient implements GitHubClient {
     let url: string | undefined = this.#base + path;
     for (let i = 0; url && i < MAX_PAGES; i++) {
       const r: Reply = await this.#request('GET', url);
+      if (r.status === 404) throw new GitHubApiError(404, 'GET', url.slice(this.#base.length));
       if (Array.isArray(r.data)) out.push(...(r.data as Json[]));
       const m = r.link ? /<([^>]+)>;\s*rel="next"/.exec(r.link) : null;
       // never follow a Link off the API host (the Authorization header would go with it)
@@ -308,7 +311,12 @@ export class FetchGitHubClient implements GitHubClient {
       query,
       variables: { o: owner, n: name, i: number }
     });
-    const issue = (r.data as Json | null)?.data?.repository?.issue as Json | undefined;
+    const reply = r.data as Json | null;
+    const issue = reply?.data?.repository?.issue as Json | undefined;
+    // Fail closed: without a real answer we can't prove the text wasn't edited after the label.
+    if (!issue || (Array.isArray(reply?.errors) && reply.errors.length > 0)) {
+      throw new GitHubApiError(r.status, 'POST', `/graphql (issue edit info for ${repo}#${number})`);
+    }
     return {
       ...(issue?.lastEditedAt ? { lastEditedAt: String(issue.lastEditedAt) } : {}),
       ...(issue?.editor?.login ? { editor: String(issue.editor.login) } : {})
@@ -329,7 +337,11 @@ export class FetchGitHubClient implements GitHubClient {
   }
 
   async removeLabel(repo: string, number: number, label: string): Promise<void> {
-    // 404 (label not on the issue) is ignored by #request
-    await this.#request('DELETE', `${this.#base}/repos/${repo}/issues/${number}/labels/${encodeURIComponent(label)}`);
+    try {
+      await this.#request('DELETE', `${this.#base}/repos/${repo}/issues/${number}/labels/${encodeURIComponent(label)}`);
+    } catch (err) {
+      // 404 = the label is already off the issue, which is the state we wanted
+      if (!(err instanceof GitHubApiError && err.status === 404)) throw err;
+    }
   }
 }

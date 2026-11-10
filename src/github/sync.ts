@@ -41,6 +41,7 @@ export function coarseReason(error: string | undefined): string {
   if (code) return `exit code ${code[1]}`;
   if (/time(d)?[ -]?out/i.test(e)) return 'timeout';
   if (/review.*block|blocked/i.test(e)) return 'review blocked';
+  if (/exited non-zero/i.test(e)) return 'the agent exited with an error';
   return 'failed';
 }
 

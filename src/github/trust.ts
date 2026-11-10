@@ -35,7 +35,7 @@ export function trustChecker(client: GitHubClient, repo: string, trustedActors: 
   return async function check(number: number, label: string): Promise<TrustResult> {
     const events = await client.listIssueEvents(repo, number);
     const labeled = events
-      .filter((e) => e.event === 'labeled' && e.label === label)
+      .filter((e) => e.event === 'labeled' && e.label?.toLowerCase() === label.toLowerCase())
       .sort((a, b) => a.id - b.id);
     const last = labeled[labeled.length - 1];
     if (!last) return { ok: false, reason: 'no-label-event' };

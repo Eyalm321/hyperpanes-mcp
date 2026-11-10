@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const FORBIDDEN: Array<[string, RegExp]> = [
-  ['merge API path', /['"`][^'"`\n]*\/merge(?![\w-])[^'"`\n]*['"`]/],
+  ['merge API path', /['"`][^'"`\n]*\/merges?(?![\w-])[^'"`\n]*['"`]/],
+  ['mergeBranch', /mergeBranch/],
   ['merge_method', /merge_method/],
   ['auto_merge', /auto_merge/],
   ['enablePullRequestAutoMerge', /enablePullRequestAutoMerge/],
@@ -31,6 +32,8 @@ describe('no merge / approve capability', () => {
   it('scanner flags planted samples and ignores prose', () => {
     for (const s of [
       "const u = '/repos/a/b/pulls/1/merge';",
+      "post(`/repos/${r}/merges`, { base, head })",
+      'mutation { mergeBranch(input: {}) }',
       'body: { merge_method: "squash" }',
       'mutation { enablePullRequestAutoMerge }',
       'mergePullRequest(',

@@ -88,6 +88,25 @@ describe('client behaviour', () => {
     await expect(client.removeLabel('acme/widgets', 1, 'x')).resolves.toBeUndefined();
     expect(await client.getIssueEditInfo('acme/widgets', 1)).toEqual({ lastEditedAt: 't', editor: 'e' });
   });
+  it('graphql edit info fails closed on errors or a missing issue', async () => {
+    const errs = mk(() => json({ data: null, errors: [{ message: 'scope' }] })).client;
+    await expect(errs.getIssueEditInfo('acme/widgets', 1)).rejects.toThrow(/graphql/);
+    const missing = mk(() => json({ data: { repository: { issue: null } } })).client;
+    await expect(missing.getIssueEditInfo('acme/widgets', 1)).rejects.toThrow(/graphql/);
+    const notFound = mk(() => json({ message: 'Not Found' }, {}, 404)).client;
+    await expect(notFound.getIssueEditInfo('acme/widgets', 1)).rejects.toThrow();
+  });
+  it('a failed write throws instead of looking like success', async () => {
+    const { client } = mk(() => json({ message: 'Validation Failed' }, {}, 422));
+    await expect(client.createIssueComment('acme/widgets', 1, 'x')).rejects.toThrow(/422/);
+    await expect(client.addLabels('acme/widgets', 1, ['hp:done'])).rejects.toThrow(/422/);
+    const gone = mk(() => json({ message: 'Not Found' }, {}, 404)).client;
+    await expect(gone.createIssueComment('acme/widgets', 1, 'x')).rejects.toThrow(/404/);
+  });
+  it('a list on a missing repo throws instead of returning nothing', async () => {
+    const { client } = mk(() => json({ message: 'Not Found' }, {}, 404));
+    await expect(client.listOpenIssuesByLabel('acme/nope', 'agent-ready')).rejects.toThrow(/404/);
+  });
   it('ETag: sends If-None-Match and reuses cached body on 304', async () => {
     let n = 0;
     const seen: Array<string | undefined> = [];
