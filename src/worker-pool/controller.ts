@@ -391,7 +391,13 @@ export class Controller {
       };
     } finally {
       // 8. always tear down — pane FIRST, then the directory it cwd'd into
-      await this.teardown({ paneId, worktree: plan.worktree, branch: plan.branch, handshake: plan.handshake });
+      await this.teardown({
+        paneId,
+        worktree: plan.worktree,
+        branch: plan.branch,
+        handshake: plan.handshake,
+        keepBranch: keepsBranch(spec)
+      });
     }
   }
 
@@ -518,6 +524,8 @@ export class Controller {
     worktree: string;
     branch: string;
     handshake: string;
+    /** GitHub-sourced tasks keep their branch so the PR step (#6) has something to push. */
+    keepBranch?: boolean;
   }): Promise<void> {
     if (ref.paneId) {
       const pane = await this.findPane(ref.paneId);
@@ -530,9 +538,15 @@ export class Controller {
     rmIfExists(ref.handshake);
     await this.git.worktreeRemove(ref.worktree).catch(() => {});
     await this.git.worktreePrune().catch(() => {});
-    await this.git.branchDelete(ref.branch).catch(() => {});
+    if (!ref.keepBranch) await this.git.branchDelete(ref.branch).catch(() => {});
     // The scoped token has no revoke primitive — it lapses via tokenTtlMs.
   }
+}
+
+/** True when the task came from GitHub (issue or CI): its branch must outlive teardown. */
+function keepsBranch(spec: { source?: unknown }): boolean {
+  const kind = (spec.source as { kind?: unknown } | undefined)?.kind;
+  return kind === 'github_issue' || kind === 'github_ci';
 }
 
 function rmIfExists(path: string): void {
