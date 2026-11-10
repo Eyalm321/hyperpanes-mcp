@@ -20,7 +20,7 @@ import { QueueClient } from '../worker-pool/queue-client.js';
 import { generateBacklog, enqueueBacklog, type GenerateResult } from './backlog.js';
 import { FetchGitHubClient } from '../github/client.js';
 import { resolveConfigPath } from '../github/config.js';
-import { runIssuesIngest } from '../github/ingest.js';
+import { runGithubIngest } from '../github/ingest.js';
 import { todoSource, jsonFileSource, type BacklogSource } from './sources.js';
 
 const USAGE = `worker-pool backlog generator
@@ -35,6 +35,9 @@ Sources (combine freely; at least one is required):
                            Repo must be opted in (see docs/github-sources.md); the repo's
                            configured queue and base are used, and it can't be combined
                            with other sources.
+  --github-ci <r|.>        Failed GitHub Actions runs in <owner/repo> -> ci_failure tasks. Needs
+                           ci.enabled in the repo's config. Combine with --github-issues only
+                           for the same repo.
 
 Options:
   --dry-run                Print the Tasks that would be enqueued, without POSTing
@@ -137,16 +140,20 @@ async function runLive(cfg: BacklogCliConfig, gen: GenerateResult): Promise<void
   process.exitCode = ok === outcomes.length ? 0 : 1;
 }
 
-async function runGithubIssues(
-  repoArg: string,
+async function runGithubIngestCli(
+  issuesArg: string | undefined,
+  ciArg: string | undefined,
   label: string | undefined,
   configFlag: string | undefined,
   dryRun: boolean
 ): Promise<void> {
   try {
-    const r = await runIssuesIngest({
+    const repoArg = (issuesArg ?? ciArg) as string;
+    const r = await runGithubIngest({
       repoArg,
       label,
+      ci: ciArg !== undefined,
+      issues: issuesArg !== undefined,
       configPath: resolveConfigPath(configFlag),
       dryRun,
       client: () => new FetchGitHubClient(),
@@ -159,6 +166,7 @@ async function runGithubIssues(
       disabled: r.disabled,
       queueChecked: r.queueChecked,
       decisions: r.decisions.map((d) => ({ number: d.number, action: d.action, ...(d.reason ? { reason: d.reason } : {}) })),
+      ciDecisions: r.ciDecisions.map((d) => ({ runId: d.runId, action: d.action, ...(d.reason ? { reason: d.reason } : {}) })),
       ...(dryRun ? { tasks: r.gen?.items.map((i) => i.request) } : { outcomes: r.outcomes })
     };
     console.log(JSON.stringify(summary, null, 2));
@@ -180,6 +188,7 @@ export async function main(): Promise<void> {
       base: { type: 'string' },
       markers: { type: 'string' },
       'github-issues': { type: 'string' },
+      'github-ci': { type: 'string' },
       label: { type: 'string' },
       'github-config': { type: 'string' },
       limit: { type: 'string' },
@@ -194,13 +203,20 @@ export async function main(): Promise<void> {
   }
 
   const cfg = configFromArgs(values);
-  if (typeof values['github-issues'] === 'string') {
+  const ghIssues = typeof values['github-issues'] === 'string' ? values['github-issues'] : undefined;
+  const ghCi = typeof values['github-ci'] === 'string' ? values['github-ci'] : undefined;
+  if (ghIssues !== undefined || ghCi !== undefined) {
     if (cfg.todos || cfg.tasksFile) {
-      console.error('[backlog] --github-issues cannot be combined with --todos/--tasks');
+      console.error('[backlog] --github-issues/--github-ci cannot be combined with --todos/--tasks');
       process.exitCode = 2;
       return;
     }
-    await runGithubIssues(values['github-issues'], values.label, values['github-config'], cfg.dryRun);
+    if (ghIssues !== undefined && ghCi !== undefined && ghIssues !== ghCi) {
+      console.error('[backlog] --github-issues and --github-ci must name the same repo');
+      process.exitCode = 2;
+      return;
+    }
+    await runGithubIngestCli(ghIssues, ghCi, values.label, values['github-config'], cfg.dryRun);
     return;
   }
   const sources = buildSources(cfg);
