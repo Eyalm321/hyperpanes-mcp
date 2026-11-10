@@ -37,7 +37,40 @@ export interface IssueComment {
   body: string;
 }
 
-/** The GitHub surface slice 1 needs. `repo` is `owner/name`. */
+export interface WorkflowRun {
+  id: number;
+  workflowId: number;
+  name: string;
+  headBranch: string;
+  headSha: string;
+  event: string;
+  url: string;
+  createdAt: string;
+  runAttempt: number;
+  displayTitle: string;
+  /** `full_name` of the head repository ('' when GitHub omits it, e.g. a deleted fork). */
+  headRepo: string;
+  /** failure, success, cancelled, … ('' while in progress). */
+  conclusion: string;
+  /** Workflow file path (e.g. `.github/workflows/ci.yml`), '' when unknown. */
+  path: string;
+}
+
+export interface JobStep {
+  name: string;
+  number: number;
+  conclusion: string;
+}
+
+export interface WorkflowJob {
+  id: number;
+  name: string;
+  conclusion: string;
+  url: string;
+  steps: JobStep[];
+}
+
+/** The GitHub surface slices 1-2 need. `repo` is `owner/name`. */
 export interface GitHubClient {
   listOpenIssuesByLabel(repo: string, label: string): Promise<GitHubIssue[]>;
   getIssue(repo: string, number: number): Promise<GitHubIssue>;
@@ -48,6 +81,12 @@ export interface GitHubClient {
   createIssueComment(repo: string, number: number, body: string): Promise<void>;
   addLabels(repo: string, number: number, labels: string[]): Promise<void>;
   removeLabel(repo: string, number: number, label: string): Promise<void>;
+  /** Failed workflow runs on `branch` created at/after `since` (ISO). Read-only. */
+  listFailedRuns(repo: string, branch: string, since: string): Promise<WorkflowRun[]>;
+  /** Newest completed run of a workflow on a branch, or null. */
+  getLatestCompletedRun(repo: string, workflowId: number, branch: string): Promise<WorkflowRun | null>;
+  /** Jobs (latest attempt) of a run. Never fetches logs. */
+  listRunJobs(repo: string, runId: number): Promise<WorkflowJob[]>;
 }
 
 export const NO_TOKEN_MESSAGE = "no GitHub token: set GITHUB_TOKEN or run 'gh auth login'";
@@ -282,6 +321,60 @@ export class FetchGitHubClient implements GitHubClient {
     const r = await this.#get(`/repos/${repo}/issues/${number}`);
     if (!r.data) throw new GitHubApiError(r.status, 'GET', `/repos/${repo}/issues/${number}`);
     return this.#issue(r.data as Json);
+  }
+
+  #run(j: Json): WorkflowRun {
+    return {
+      id: Number(j.id),
+      workflowId: Number(j.workflow_id),
+      name: String(j.name ?? ''),
+      headBranch: String(j.head_branch ?? ''),
+      headSha: String(j.head_sha ?? ''),
+      event: String(j.event ?? ''),
+      url: String(j.html_url ?? ''),
+      createdAt: String(j.created_at ?? ''),
+      runAttempt: Number(j.run_attempt ?? 1),
+      displayTitle: String(j.display_title ?? ''),
+      headRepo: String(j.head_repository?.full_name ?? ''),
+      conclusion: String(j.conclusion ?? ''),
+      path: String(j.path ?? '')
+    };
+  }
+
+  async #getRuns(path: string): Promise<WorkflowRun[]> {
+    const r = await this.#get(path);
+    // fail closed: a 404 is "unknown", not "no failures"
+    if (r.status === 404 || !r.data) throw new GitHubApiError(r.status, 'GET', path);
+    const rows = (r.data as Json).workflow_runs;
+    return Array.isArray(rows) ? (rows as Json[]).map((j) => this.#run(j)) : [];
+  }
+
+  async listFailedRuns(repo: string, branch: string, since: string): Promise<WorkflowRun[]> {
+    const q = `status=failure&branch=${encodeURIComponent(branch)}&created=${encodeURIComponent('>=' + since)}&per_page=100`;
+    return this.#getRuns(`/repos/${repo}/actions/runs?${q}`);
+  }
+
+  async getLatestCompletedRun(repo: string, workflowId: number, branch: string): Promise<WorkflowRun | null> {
+    const q = `branch=${encodeURIComponent(branch)}&status=completed&per_page=1`;
+    return (await this.#getRuns(`/repos/${repo}/actions/workflows/${workflowId}/runs?${q}`))[0] ?? null;
+  }
+
+  async listRunJobs(repo: string, runId: number): Promise<WorkflowJob[]> {
+    const path = `/repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`;
+    const r = await this.#get(path);
+    if (r.status === 404 || !r.data) throw new GitHubApiError(r.status, 'GET', path);
+    const rows = (r.data as Json).jobs;
+    return (Array.isArray(rows) ? (rows as Json[]) : []).map((j) => ({
+      id: Number(j.id),
+      name: String(j.name ?? ''),
+      conclusion: String(j.conclusion ?? ''),
+      url: String(j.html_url ?? ''),
+      steps: ((j.steps ?? []) as Json[]).map((st) => ({
+        name: String(st.name ?? ''),
+        number: Number(st.number),
+        conclusion: String(st.conclusion ?? '')
+      }))
+    }));
   }
 
   async listIssueEvents(repo: string, number: number): Promise<IssueEvent[]> {

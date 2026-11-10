@@ -1,6 +1,6 @@
 {
   "name": "@eyalm321/hyperpanes-mcp",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "MCP server for hyperpanes (Electron terminal-workspace app) \u2014 compose, validate, and launch workspace layouts, and drive a running instance (read/spawn/layout panes, stream output, guarded input)",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"

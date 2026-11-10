@@ -5,7 +5,9 @@ import type {
   IssueComment,
   IssueEditInfo,
   IssueEvent,
-  Permission
+  Permission,
+  WorkflowJob,
+  WorkflowRun
 } from './client.js';
 
 export const WRITE_METHODS = ['createIssueComment', 'addLabels', 'removeLabel'];
@@ -17,6 +19,29 @@ export class MockGitHub implements GitHubClient {
   perms = new Map<string, Permission>();
   edits = new Map<number, IssueEditInfo>();
   comments = new Map<number, IssueComment[]>();
+  /** every run (any conclusion); listFailedRuns/getLatestCompletedRun derive from it */
+  runs: WorkflowRun[] = [];
+  jobs = new Map<number, WorkflowJob[]>();
+
+  addRun(r: Partial<WorkflowRun> & { id: number }): WorkflowRun {
+    const run: WorkflowRun = {
+      workflowId: 7,
+      name: 'CI',
+      headBranch: 'main',
+      headSha: 'abc1234',
+      event: 'push',
+      url: `https://github.com/acme/widgets/actions/runs/${r.id}`,
+      createdAt: new Date(Date.now() - 3600_000 + r.id).toISOString(),
+      runAttempt: 1,
+      displayTitle: 'Fix the widget',
+      headRepo: 'acme/widgets',
+      conclusion: 'failure',
+      path: '.github/workflows/ci.yml',
+      ...r
+    };
+    this.runs.push(run);
+    return run;
+  }
 
   private rec(method: string, ...args: unknown[]): void {
     this.calls.push({ method, args });
@@ -80,5 +105,23 @@ export class MockGitHub implements GitHubClient {
     this.rec('removeLabel', repo, n, label);
     const i = this.issues.find((x) => x.number === n);
     if (i) i.labels = i.labels.filter((l) => l !== label);
+  }
+
+  async listFailedRuns(repo: string, branch: string, since: string) {
+    this.rec('listFailedRuns', repo, branch, since);
+    return this.runs.filter(
+      (r) => r.conclusion === 'failure' && r.headBranch === branch && Date.parse(r.createdAt) >= Date.parse(since)
+    );
+  }
+  async getLatestCompletedRun(repo: string, workflowId: number, branch: string) {
+    this.rec('getLatestCompletedRun', repo, workflowId, branch);
+    const c = this.runs
+      .filter((r) => r.workflowId === workflowId && r.headBranch === branch && r.conclusion !== '')
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.id - a.id);
+    return c[0] ?? null;
+  }
+  async listRunJobs(repo: string, runId: number) {
+    this.rec('listRunJobs', repo, runId);
+    return this.jobs.get(runId) ?? [];
   }
 }

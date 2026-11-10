@@ -298,6 +298,10 @@ Turn labelled GitHub issues into queued tasks, and sync task status back to the 
 # ingest: queue open issues labelled `agent-ready` (use --dry-run to preview)
 node dist/backlog/cli.js --github-issues acme/widgets [--label agent-ready] [--github-config p] [--dry-run]
 
+# ingest: queue the newest failed GitHub Actions run per workflow+branch as a `ci_failure` task
+# (needs "ci": {"enabled": true} for the repo; may be combined with --github-issues for the same repo)
+node dist/backlog/cli.js --github-ci acme/widgets [--github-config p] [--dry-run]
+
 # sync-back: reconcile queue state onto the issues
 node dist/github/cli.js sync [--repo acme/widgets] [--once | --watch 300] [--dry-run]
 ```
