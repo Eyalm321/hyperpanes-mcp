@@ -68,6 +68,9 @@ Only open issues that carry the trigger label are queued. The label is `label` f
 from the issues API too, and they are skipped. At most `limit` issues are queued per run, oldest
 first.
 
+GitHub's label-filtered issue list can trail a brand-new issue by a few seconds. An issue that
+was labeled just before a run may only show up on the next run; nothing is lost.
+
 ## 4. Payload safety (issue text is untrusted)
 
 Issue titles and bodies are written by the public, and an agent will execute the task built from

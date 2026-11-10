@@ -186,6 +186,7 @@ async function step(o: PrStepOptions): Promise<PrOutcome> {
       const diff = await git.diff(spec.base, local);
       const res = await reviewDiff({ diff, title, body: spec.prompt }, o.runner);
       remember({ verdict: res.verdict, risk: res.risk });
+      log(`review ${repo} ${t.kind === 'issue' ? '#' : 'run '}${t.ref}: ${res.verdict} (risk ${res.risk})`);
       if (res.verdict !== 'approve') return finish({ final: true, kind: 'review-blocked', risk: res.risk });
       review = { verdict: 'approve', risk: res.risk };
     }
@@ -210,6 +211,7 @@ async function step(o: PrStepOptions): Promise<PrOutcome> {
     throw err;
   }
   o.onAction?.('push', `${local} → ${remoteBranch}`);
+  log(`push ${local} → ${remoteBranch}`);
 
   // f+h. kill switch again, then the draft PR
   if (!o.active()) return { final: false, error: 'disabled' };
@@ -221,6 +223,7 @@ async function step(o: PrStepOptions): Promise<PrOutcome> {
     draft: pr.draft
   });
   o.onAction?.('pr', title);
+  log(`opened ${pr.draft ? 'draft ' : ''}PR #${created.number} ${created.url}`);
   return finish({ final: true, kind: 'pr-opened', number: created.number, url: created.url, draft: pr.draft });
 }
 
