@@ -18,10 +18,19 @@ import {
 } from './launch.js';
 import { registerControlTools } from './control-tools.js';
 import { registerQueueTools } from './queue-tools.js';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 
-const VERSION = '0.1.0';
+// The package version, read once from package.json (one level above both src/ and dist/), so
+// MCP serverInfo.version matches the installed package instead of a hand-maintained constant.
+export const VERSION: string = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 /** JSON tool result (machine-readable) with an optional error flag. */
 function json(data: unknown, isError = false) {
