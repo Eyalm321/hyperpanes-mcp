@@ -6,9 +6,11 @@ import {
   pickBuild,
   renameTabResult,
   recolorTabResult,
+  openTabResult,
   TAB_COLOR_RE,
   TAB_TITLE_MAX
 } from './control-tools.js';
+import { GroupSpecSchema } from './schema.js';
 import type { ControlState, ControlPane } from './control/model.js';
 
 // Cold-start submit-drop detector (prompt_pane self-heal). The signature of a
@@ -177,5 +179,29 @@ describe('rename_tab / recolor_tab', () => {
     expect(p?.tabColor).toBe('#aabbcc');
     const plain = { windows: [{ windowId: 1, activeTabId: 't1', tabs: [{ id: 't1', title: 'T', layout: 'single', panes: [pane] }] }] } as unknown as ControlState;
     expect(listPanesResult(plain).panes[0]?.tabColor).toBeNull();
+  });
+});
+
+describe('open_tab group colour', () => {
+  it('passes a group color through to attach as the new tab\'s colour', async () => {
+    const sent: unknown[] = [];
+    const c = {
+      state: async () => ({ windows: [{ windowId: 3, activeTabId: null, tabs: [] }] }),
+      command: async (cmd: unknown) => {
+        sent.push(cmd);
+        return { ok: true, result: ['tab-1'] };
+      }
+    } as never;
+    const groups = [{ title: 'build', color: '#e5484d', panes: [{ command: 'npm test', color: '#3b82f6' }] }];
+    const r = await openTabResult(c, groups);
+    expect(sent).toEqual([{ type: 'attach', windowId: 3, groups, as: 'tab' }]);
+    expect(r).toEqual({ ok: true, windowId: 3, as: 'tab', ids: ['tab-1'] });
+  });
+
+  it('the open_tab group schema takes color next to title (hex or null) and rejects bad ones', () => {
+    expect(GroupSpecSchema.safeParse({ title: 'a', color: '#abc', panes: [] }).success).toBe(true);
+    expect(GroupSpecSchema.safeParse({ title: 'a', color: null, panes: [] }).success).toBe(true);
+    expect(GroupSpecSchema.safeParse({ title: 'a', panes: [] }).success).toBe(true);
+    expect(GroupSpecSchema.safeParse({ title: 'a', color: 'red', panes: [] }).success).toBe(false);
   });
 });

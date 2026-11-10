@@ -75,9 +75,19 @@ export const PaneSpecSchema = z
 export type PaneSpec = z.infer<typeof PaneSpecSchema>;
 
 /** A tab: an ordered set of panes with a tiling layout. Mirrors `GroupSpec`. */
+/** A manual tab colour: `#rgb` or `#rrggbb`, either case (the app stores lowercase `#rrggbb`). */
+export const TAB_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
 export const GroupSpecSchema = z
   .object({
     title: z.string().optional(),
+    // Manual tab colour (the tab chip's stripe + tint), the same field recolor_tab sets.
+    // null = none. JSON-only — the CLI grammar has no tab-colour flag (see compile-cli).
+    color: z
+      .string()
+      .regex(TAB_COLOR_RE, 'expected a hex colour like "#e5484d" or "#e54"')
+      .nullable()
+      .optional(),
     layout: LayoutSchema.optional(),
     panes: z.array(PaneSpecSchema),
     // Sizing / focus / zoom. JSON-only — the CLI grammar can't express them (see

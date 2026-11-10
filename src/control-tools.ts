@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { LayoutSchema, GroupSpecSchema } from './schema.js';
+import { LayoutSchema, GroupSpecSchema, TAB_COLOR_RE, type GroupSpec } from './schema.js';
 import { ControlUnavailableError, readDiscovery, controlFilePath } from './control/discovery.js';
 import { ControlClient } from './control/client.js';
 import {
@@ -552,25 +552,14 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Open tab(s)',
       description:
-        'Attach one or more new tabs to an existing window (defaults to the first window), each with fresh shells — the programmatic equivalent of `hyperpanes --attach`. Returns the new tab ids. Use this (not open_pane) to add a whole tab, or several tabs, in one call. Pass `as:"panes"` to instead merge ALL the given panes into the window\'s ACTIVE tab (returns the new pane ids). Each group is one tab: { title?, layout?, panes:[{ command?, args?, label?, cwd?, shell?, color?, meta? }] }.',
+        'Attach one or more new tabs to an existing window (defaults to the first window), each with fresh shells — the programmatic equivalent of `hyperpanes --attach`. Returns the new tab ids. Use this (not open_pane) to add a whole tab, or several tabs, in one call. Pass `as:"panes"` to instead merge ALL the given panes into the window\'s ACTIVE tab (returns the new pane ids). Each group is one tab: { title?, color?, layout?, panes:[{ command?, args?, label?, cwd?, shell?, color?, meta? }] }. A group `color` ("#rrggbb"/"#rgb") is the new tab\'s manual colour, the same one recolor_tab sets (it overrides a pane-group colour); a pane `color` is that pane\'s frame colour.',
       inputSchema: {
         groups: z.array(GroupSpecSchema).min(1),
         as: z.enum(['tab', 'panes']).optional(),
         windowId: z.number().int().optional()
       }
     },
-    async ({ groups, as, windowId }) =>
-      run(async (c) => {
-        const state = await c.state();
-        const target = windowId ?? firstWindowId(state);
-        if (target == null) throw new Error('no windows open to attach to');
-        const unit = as ?? 'tab';
-        // The app returns the new tab ids (unit:'tab') or pane ids (unit:'panes')
-        // via the command round-trip (D), mirroring newPane → id.
-        const res = await c.command({ type: 'attach', windowId: target, groups, as: unit });
-        const ids = Array.isArray(res.result) ? (res.result as string[]) : [];
-        return { ok: true, windowId: target, as: unit, ids };
-      })
+    async ({ groups, as, windowId }) => run((c) => openTabResult(c, groups, as, windowId))
   );
 
   // ---- projects (the remembered-directory registry / sidebar rail) -----
@@ -1302,8 +1291,29 @@ function registerPaneResources(server: McpServer): void {
 /** Longest tab title the app accepts (it answers 400 above this). */
 export const TAB_TITLE_MAX = 80;
 
-/** Tab colours the app accepts: `#rgb` or `#rrggbb`, either case (stored as lowercase `#rrggbb`). */
-export const TAB_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+/** Tab colours the app accepts (re-exported from the schema): `#rgb` or `#rrggbb`. */
+export { TAB_COLOR_RE };
+
+/**
+ * open_tab: attach `groups` to a window (default: the first). Groups go to the app's `attach`
+ * command verbatim, so a group `color` becomes the new tab's manual colour.
+ */
+export async function openTabResult(
+  c: Pick<ControlClient, 'state' | 'command'>,
+  groups: GroupSpec[],
+  as?: 'tab' | 'panes',
+  windowId?: number
+) {
+  const state = await c.state();
+  const target = windowId ?? firstWindowId(state);
+  if (target == null) throw new Error('no windows open to attach to');
+  const unit = as ?? 'tab';
+  // The app returns the new tab ids (unit:'tab') or pane ids (unit:'panes')
+  // via the command round-trip (D), mirroring newPane → id.
+  const res = await c.command({ type: 'attach', windowId: target, groups, as: unit });
+  const ids = Array.isArray(res.result) ? (res.result as string[]) : [];
+  return { ok: true, windowId: target, as: unit, ids };
+}
 
 /** rename_tab: maps 1:1 to the app's `renameTab` command. */
 export async function renameTabResult(c: Pick<ControlClient, 'command'>, tabId: string, title: string) {

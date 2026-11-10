@@ -14,6 +14,7 @@ import { windowsOf, type WorkspaceFile, type WindowSpec, type PaneSpec } from '.
  *   - a pane with no `command`   (CLI panes only exist via `-c`)
  *   - tab `sizes`/`mainFraction` (split ratios — no flag)
  *   - tab `focused`/`zoomed`     (focused / maximized pane index — no flag)
+ *   - tab `color`                (manual tab colour — no flag)
  *
  * When any of these are present, prefer launching via a written `.json` file
  * (lossless). `lossy` lists what a CLI launch would drop.
@@ -45,6 +46,7 @@ function collectLossy(windows: WindowSpec[]): string[] {
       if (g.mainFraction != null) lossy.add('main-stack fraction');
       if (g.focused != null) lossy.add('focused pane index');
       if (g.zoomed != null) lossy.add('maximized pane index');
+      if (g.color) lossy.add('tab colour');
       for (const p of g.panes) {
         if (p.subtitle) lossy.add('pane subtitle');
         if (p.meta && Object.keys(p.meta).length) lossy.add('pane metadata');

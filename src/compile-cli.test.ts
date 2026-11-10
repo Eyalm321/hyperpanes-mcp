@@ -127,6 +127,16 @@ describe('compileCli', () => {
     );
   });
 
+  it('flags a tab colour as a JSON-only lossy field', () => {
+    const { lossy, lossless } = compileCli({
+      windows: [{ groups: [{ title: 'build', color: '#e5484d', panes: [{ command: 'a' }] }] }]
+    });
+    expect(lossless).toBe(false);
+    expect(lossy).toContain('tab colour');
+    // null (no colour) is not lossy.
+    expect(compileCli({ windows: [{ groups: [{ color: null, panes: [{ command: 'a' }] }] }] }).lossless).toBe(true);
+  });
+
   it('toCommandLine quotes args containing spaces', () => {
     expect(toCommandLine('hyperpanes', ['-c', 'npm run dev'])).toBe('hyperpanes -c "npm run dev"');
   });

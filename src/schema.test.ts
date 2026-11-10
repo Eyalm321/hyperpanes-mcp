@@ -81,6 +81,15 @@ describe('validateWorkspace', () => {
     expect(r.valid).toBe(true);
   });
 
+  it('accepts a tab colour (#rrggbb, #rgb, null) and rejects anything else', () => {
+    for (const color of ['#e5484d', '#E54', null]) {
+      expect(validateWorkspace({ groups: [{ title: 't', color, panes: [{ command: 'a' }] }] }).valid).toBe(true);
+    }
+    for (const color of ['red', '#12345', 'e5484d', 7]) {
+      expect(validateWorkspace({ groups: [{ title: 't', color, panes: [{ command: 'a' }] }] }).valid).toBe(false);
+    }
+  });
+
   it('rejects a negative size or non-integer focus index', () => {
     expect(
       validateWorkspace({ groups: [{ panes: [{ command: 'a' }], sizes: [-1] }] }).valid

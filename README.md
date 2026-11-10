@@ -46,6 +46,7 @@ It works at two levels, and you can use either without the other:
 | Tool | Description |
 |---|---|
 | `open_pane` | Open a new pane in a window's active tab (defaults to the first window). Returns the new `paneId`; accepts `meta` (org metadata) and `env` (e.g. a scoped token) at spawn. Pass `args` (a string array) to run `command` **directly** with that verbatim argv — no shell, no re-parse — the reliable way to pass arguments containing spaces/quotes (e.g. `command:"claude", args:["--append-system-prompt","…persona…"]`). |
+| `open_tab` | Attach one or more new tabs to a window, each with fresh shells; returns the new tab ids (`as:"panes"` merges the panes into the active tab instead). Each group is `{ title?, color?, layout?, panes }`: a group `color` (`"#rrggbb"`/`"#rgb"`) is the new tab's manual colour, the same one `recolor_tab` sets; a pane `color` is that pane's frame colour. |
 | `set_layout` | Set a tab's tiling layout (defaults to the first window's active tab). |
 | `focus_pane` | Focus a pane (and its tab/window). |
 | `close_pane` | Close a pane, terminating its shell. |
@@ -222,19 +223,20 @@ single-window fields are kept for back-compat, and everything normalizes through
 ```
 WorkspaceFile { name?, layout?, panes?, groups?, active?, windows? }
 WindowSpec    { title?, active?, bounds?, groups[] }
-GroupSpec     { title?, layout?, panes[], sizes?, mainFraction?, focused?, zoomed? }   // a tab
+GroupSpec     { title?, color?, layout?, panes[], sizes?, mainFraction?, focused?, zoomed? }   // a tab
 PaneSpec      { label?, subtitle?, color?, command?, cwd?, shell?, fontSize? }
 Layout        = auto | single | columns | rows | grid | main-stack
 ```
 
 - **Launch modes.** `launch_workspace` defaults to writing a temp `.json` (**lossless**).
   `mode:"cli"` compiles to `--window`/`--tab`/`-c …` flags — convenient but **lossy**: window
-  bounds, the active-tab index, pane subtitle, split sizes, and command-less panes are JSON-only
-  and reported in `lossy`.
+  bounds, the active-tab index, pane subtitle, split sizes, tab colour, and command-less panes
+  are JSON-only and reported in `lossy`.
 - **Relative `cwd`.** In a workspace *file*, relative `cwd` resolves against the file's dir.
   Inline specs are written to a temp file — prefer absolute `cwd` for inline specs.
 - **Strict validation.** Unknown keys are rejected (typo guard), `layout` must be a known id,
-  `fontSize` a positive integer, and a workspace must declare at least one pane.
+  `fontSize` a positive integer, a tab `color` `"#rrggbb"`/`"#rgb"` (or `null`), and a workspace
+  must declare at least one pane.
 
 See [`examples/dev.workspace.json`](examples/dev.workspace.json) for a full two-window spec.
 
