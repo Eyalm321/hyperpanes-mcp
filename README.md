@@ -289,3 +289,17 @@ triggered by creating a **GitHub Release**, which publishes to **both** registri
 ## License
 
 MIT © Eyalm321
+
+## GitHub sources
+
+Turn labelled GitHub issues into queued tasks, and sync task status back to the issue (comments and `hp:*` labels). Opt-in per repo via a config file; issue text is treated as untrusted. Design and contract: [`docs/github-sources.md`](docs/github-sources.md).
+
+```sh
+# ingest: queue open issues labelled `agent-ready` (use --dry-run to preview)
+node dist/backlog/cli.js --github-issues acme/widgets [--label agent-ready] [--github-config p] [--dry-run]
+
+# sync-back: reconcile queue state onto the issues
+node dist/github/cli.js sync [--repo acme/widgets] [--once | --watch 300] [--dry-run]
+```
+
+Auth: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`.
