@@ -68,6 +68,9 @@ Only open issues that carry the trigger label are queued. The label is `label` f
 from the issues API too, and they are skipped. At most `limit` issues are queued per run, oldest
 first.
 
+GitHub's label-filtered issue list can trail a brand-new issue by a few seconds. An issue that
+was labeled just before a run may only show up on the next run; nothing is lost.
+
 ## 4. Payload safety (issue text is untrusted)
 
 Issue titles and bodies are written by the public, and an agent will execute the task built from
@@ -239,6 +242,15 @@ This is the policy #6 asks to have recorded. You decide; these are my proposed d
   `dist/` output and fails if any merge or approve API path appears (`/merge`,
   `enablePullRequestAutoMerge`, `mergePullRequest`, `/reviews` with `APPROVE`, `gh pr merge`,
   `--auto`). The repo's normal review and branch protection decide the rest.
+
+**Implementation notes (slice 3).**
+
+- `pr.checkout` is required when `pr.enabled` is true (config error otherwise).
+- Remote branch names are `hp/issue-<n>-<id8>` and `hp/ci-<runId>-<id8>`. A same-repo head is assumed, so the PR lookup uses `<owner>:<branch>` with the opted-in owner.
+- Outcomes are `pr-opened`, `pr-exists`, `no-commits`, `review-blocked` (all final), or an error (not final: recorded, retried next cycle, no `done` comment). A remote whose URL is not the opted-in repo, a non-fast-forward rejection and a kill switch flipped mid-step are all non-final errors.
+- The `done` comment is posted only after a final outcome and says which one. `review-blocked` posts a `state=review-blocked` comment (verdict and risk only; the judge's summary is never posted) instead of a `done` comment.
+- Verdict cache: for issues, the `review-blocked` marker; for CI tasks (no thread), `$XDG_STATE_HOME/hyperpanes-mcp/github-sync-state.json`, keyed by task id. The same file also records approvals and final CI outcomes so a CI task is not re-examined every cycle. Dry runs never write it.
+- The kill switch is re-read right before the push and again before the PR is created.
 
 ## 10. Commands
 

@@ -8,7 +8,9 @@ import { QueueClient } from '../worker-pool/queue-client.js';
 import { FetchGitHubClient, NoTokenError, type GitHubClient, RateLimitError } from './client.js';
 import { isRepoActive, loadConfig, requireOptedIn, resolveConfigPath } from './config.js';
 import type { TaskLister } from './queue.js';
+import type { GitOps } from './git-ops.js';
 import { reconcileRepo } from './sync.js';
+import type { ReviewRunner } from '../worker-pool/review.js';
 
 const USAGE = `GitHub sync-back (queue state -> issue comments/labels)
 
@@ -32,6 +34,10 @@ export interface SyncRunOptions {
   queue: () => TaskLister;
   sleep?: (ms: number) => Promise<void>;
   maxCycles?: number;
+  /** PR step seams (#6); tests inject fakes. */
+  git?: (checkout: string) => GitOps;
+  reviewRunner?: ReviewRunner;
+  prStatePath?: string;
   log?: (line: string) => void;
 }
 
@@ -58,6 +64,9 @@ export async function runSyncCycle(o: SyncRunOptions): Promise<{ writes: number;
       repo,
       repoCfg: config,
       dryRun: o.dryRun,
+      ...(o.git ? { git: o.git } : {}),
+      ...(o.reviewRunner ? { reviewRunner: o.reviewRunner } : {}),
+      ...(o.prStatePath ? { prStatePath: o.prStatePath } : {}),
       recheck: () => isRepoActive(loadConfig(o.configPath), repo),
       log
     }).catch((err: unknown) => {

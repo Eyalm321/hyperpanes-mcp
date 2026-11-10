@@ -36,6 +36,10 @@ const RepoConfigSchema = z
         remote: z.string().default('origin')
       })
       .strict()
+      .refine((p) => !p.enabled || (p.checkout !== undefined && p.checkout.length > 0), {
+        message: 'pr.checkout is required when pr.enabled is true (path to the local clone to push from)',
+        path: ['checkout']
+      })
       .default({ enabled: false, draft: true, review: true, remote: 'origin' })
   })
   .strict();
