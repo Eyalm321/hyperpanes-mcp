@@ -6,6 +6,8 @@ export interface Health {
   app: string;
   pid: number;
   version: string;
+  /** Build label (e.g. a private build id); omitted on public builds and older apps. */
+  build?: string;
   allowInput: boolean;
 }
 

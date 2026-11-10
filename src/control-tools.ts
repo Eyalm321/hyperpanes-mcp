@@ -14,7 +14,8 @@ import {
   resolveWindowIdForTab,
   resolveWhoami,
   subtreePaneIds,
-  type ControlState
+  type ControlState,
+  type AppInfo
 } from './control/model.js';
 import { checkInputAllowed, readInputGate } from './control/input-gate.js';
 import { PaneSubscriptions } from './control/subscriptions.js';
@@ -101,7 +102,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Control status',
       description:
-        'Check whether the hyperpanes control API is reachable and whether input is allowed. Reports the app pid/version, the bridge-side send_input gate, and the control.json path. Call this first if other control tools fail.'
+        'Check whether the hyperpanes control API is reachable and whether input is allowed. Reports the app pid/version (and build, when the app reports one), the bridge-side send_input gate, and the control.json path. Call this first if other control tools fail.'
     },
     async () => {
       let client: ControlClient;
@@ -118,11 +119,13 @@ export function registerControlTools(server: McpServer): void {
       try {
         const health = await client.health();
         const state = await client.state();
+        const build = pickBuild(health, state);
         return json({
           available: true,
           port: client.discovery.port,
           pid: health.pid,
           version: health.version,
+          ...(build ? { build } : {}),
           appAllowsInput: health.allowInput,
           windows: state.windows.length,
           panes: flattenPanes(state).length,
@@ -145,34 +148,7 @@ export function registerControlTools(server: McpServer): void {
     async () =>
       run(async (c) => {
         const state = await c.state();
-        return {
-          ok: true,
-          panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, layout, activeTab }) => ({
-            paneId: pane.id,
-            label: pane.label,
-            // Secondary header line, omitted when unset (set via rename_pane).
-            ...(pane.subtitle ? { subtitle: pane.subtitle } : {}),
-            status: pane.status,
-            // Liveness heuristic: 'idle' ≈ waiting at its prompt / done, 'busy' =
-            // recently emitting output, 'exited' = gone. Not a "task complete" guarantee.
-            activity: pane.activity,
-            exitCode: pane.exitCode,
-            command: pane.command,
-            // Direct-spawn argv (P4a), omitted when the pane uses the shell path.
-            ...(pane.args && pane.args.length ? { args: pane.args } : {}),
-            cwd: pane.cwd,
-            shell: pane.shell,
-            color: pane.color,
-            // Free-form org metadata (role/parent/agentType/task), omitted when unset.
-            ...(pane.meta ? { meta: pane.meta } : {}),
-            windowId,
-            tabId,
-            tabTitle,
-            layout,
-            activeTab,
-            outputResource: paneOutputUri(pane.id)
-          }))
-        };
+        return listPanesResult(state);
       })
   );
 
@@ -1043,7 +1019,7 @@ function registerMessagingTools(server: McpServer): void {
     {
       title: 'Who am I',
       description:
-        'Identify the pane this MCP bridge is running inside (from HYPERPANES_PANE_ID) and report its org metadata (role/parent/agentType/task) + window/tab context. The recursion enabler: a manager-agent-in-a-pane calls this to learn who it is before driving its sub-workers. Optionally pass paneId to describe a specific pane instead.',
+        'Identify the pane this MCP bridge is running inside (from HYPERPANES_PANE_ID) and report its org metadata (role/parent/agentType/task) + window/tab context, plus `app` (the running hyperpanes version, and build when reported). The recursion enabler: a manager-agent-in-a-pane calls this to learn who it is before driving its sub-workers. Optionally pass paneId to describe a specific pane instead.',
       inputSchema: { paneId: z.string().optional() }
     },
     async ({ paneId }) =>
@@ -1056,9 +1032,7 @@ function registerMessagingTools(server: McpServer): void {
               'HYPERPANES_PANE_ID is not set — this bridge is not running inside a hyperpanes pane. Pass paneId explicitly.'
           };
         }
-        const who = resolveWhoami(await c.state(), self);
-        if (!who) return { ok: false, error: `pane ${self} not found in /state (out of scope?)` };
-        return { ok: true, ...who };
+        return whoamiResult(c, self);
       })
   );
 
@@ -1290,4 +1264,70 @@ function registerPaneResources(server: McpServer): void {
     subs.unsubscribe(req.params.uri);
     return {};
   });
+}
+
+/** list_panes output. `app` (running hyperpanes version/build) is included when the app reports it. */
+export function listPanesResult(state: ControlState) {
+  return {
+    ok: true,
+    ...(state.app ? { app: state.app } : {}),
+    panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, layout, activeTab }) => ({
+        paneId: pane.id,
+        label: pane.label,
+        // Secondary header line, omitted when unset (set via rename_pane).
+        ...(pane.subtitle ? { subtitle: pane.subtitle } : {}),
+        status: pane.status,
+        // Liveness heuristic: 'idle' ≈ waiting at its prompt / done, 'busy' =
+        // recently emitting output, 'exited' = gone. Not a "task complete" guarantee.
+        activity: pane.activity,
+        exitCode: pane.exitCode,
+        command: pane.command,
+        // Direct-spawn argv (P4a), omitted when the pane uses the shell path.
+        ...(pane.args && pane.args.length ? { args: pane.args } : {}),
+        cwd: pane.cwd,
+        shell: pane.shell,
+        color: pane.color,
+        // Free-form org metadata (role/parent/agentType/task), omitted when unset.
+        ...(pane.meta ? { meta: pane.meta } : {}),
+        windowId,
+        tabId,
+        tabTitle,
+        layout,
+        activeTab,
+        outputResource: paneOutputUri(pane.id)
+    }))
+  };
+}
+
+/**
+ * The running app's version/build. Prefers /state's `app`; older apps lack it, so
+ * fall back to /health. Returns undefined if neither yields a version — callers
+ * must never fail because of this.
+ */
+export async function resolveAppInfo(
+  c: Pick<ControlClient, 'health'>,
+  state: ControlState
+): Promise<AppInfo | undefined> {
+  if (state.app?.version) return state.app;
+  try {
+    const h = await c.health();
+    if (h.version) return { version: h.version, ...(h.build ? { build: h.build } : {}) };
+  } catch {
+    /* best-effort */
+  }
+  return undefined;
+}
+
+/** whoami result for `self`; `app` is included when the running version is known. */
+export async function whoamiResult(c: Pick<ControlClient, 'health' | 'state'>, self: string) {
+  const state = await c.state();
+  const who = resolveWhoami(state, self);
+  if (!who) return { ok: false, error: `pane ${self} not found in /state (out of scope?)` };
+  const app = await resolveAppInfo(c, state);
+  return { ok: true, ...who, ...(app ? { app } : {}) };
+}
+
+/** control_status `build`: /health's, else /state.app's; undefined on public builds / older apps. */
+export function pickBuild(health: { build?: string }, state: ControlState): string | undefined {
+  return health.build ?? state.app?.build;
 }

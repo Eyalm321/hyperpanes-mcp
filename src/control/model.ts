@@ -37,7 +37,15 @@ export interface ControlWindow {
   tabs: ControlTab[];
 }
 
+/** Running app identity, reported first in /state by newer apps. */
+export interface AppInfo {
+  version: string;
+  build?: string;
+}
+
 export interface ControlState {
+  /** Absent on older apps. */
+  app?: AppInfo;
   windows: ControlWindow[];
 }
 
