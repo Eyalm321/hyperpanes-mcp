@@ -246,6 +246,8 @@ This is the policy #6 asks to have recorded. You decide; these are my proposed d
 # ingest (#3, #4): the backlog CLI's existing --dry-run applies
 node dist/backlog/cli.js --github-issues [owner/repo] [--label agent-ready] [--github-config p] [--dry-run]
 node dist/backlog/cli.js --github-ci     [owner/repo] [--github-config p] [--dry-run]
+# --github-issues and --github-ci may be combined only when they name the same repo.
+# --github-ci refuses with `ci not enabled for <repo>` unless that repo's ci.enabled is true.
 
 # sync-back + PR (#5, #6)
 node dist/github/cli.js sync [--repo owner/repo] [--once | --watch 60] [--dry-run] [--github-config p]
