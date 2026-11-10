@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { submitLikelyDropped, whoamiResult, listPanesResult, pickBuild } from './control-tools.js';
+import {
+  submitLikelyDropped,
+  whoamiResult,
+  listPanesResult,
+  pickBuild,
+  renameTabResult,
+  recolorTabResult,
+  TAB_COLOR_RE,
+  TAB_TITLE_MAX
+} from './control-tools.js';
 import type { ControlState, ControlPane } from './control/model.js';
 
 // Cold-start submit-drop detector (prompt_pane self-heal). The signature of a
@@ -101,5 +110,72 @@ describe('running app version', () => {
     expect(pickBuild({ build: 'h' }, base({ version: '1', build: 's' }))).toBe('h');
     expect(pickBuild({}, base({ version: '1', build: 's' }))).toBe('s');
     expect(pickBuild({}, base({ version: '1' }))).toBeUndefined();
+  });
+});
+
+describe('rename_tab / recolor_tab', () => {
+  // A fake client that records every POST /command body.
+  const recorder = () => {
+    const sent: unknown[] = [];
+    const c = {
+      command: async (cmd: unknown) => {
+        sent.push(cmd);
+        return { ok: true };
+      }
+    } as never;
+    return { c, sent };
+  };
+
+  it('rename_tab sends exactly renameTab {tabId, title}', async () => {
+    const { c, sent } = recorder();
+    const r = await renameTabResult(c, '0:1', 'build');
+    expect(sent).toEqual([{ type: 'renameTab', tabId: '0:1', title: 'build' }]);
+    expect(r).toEqual({ ok: true, tabId: '0:1', title: 'build' });
+  });
+
+  it('recolor_tab sends recolorTab {tabId, color}', async () => {
+    const { c, sent } = recorder();
+    const r = await recolorTabResult(c, 'abc-123', '#e5484d');
+    expect(sent).toEqual([{ type: 'recolorTab', tabId: 'abc-123', color: '#e5484d' }]);
+    expect(r).toEqual({ ok: true, tabId: 'abc-123', color: '#e5484d' });
+  });
+
+  it('recolor_tab with null sends an explicit color:null (clears the manual colour)', async () => {
+    const { c, sent } = recorder();
+    await recolorTabResult(c, '0:0', null);
+    expect(sent).toEqual([{ type: 'recolorTab', tabId: '0:0', color: null }]);
+    expect('color' in (sent[0] as object)).toBe(true);
+  });
+
+  it('surfaces the app error (e.g. unknown tab) instead of reporting ok', async () => {
+    const c = {
+      command: async () => {
+        throw new Error('no such tab: 9:9');
+      }
+    } as never;
+    await expect(renameTabResult(c, '9:9', 'x')).rejects.toThrow('no such tab: 9:9');
+    await expect(recolorTabResult(c, '9:9', null)).rejects.toThrow('no such tab: 9:9');
+  });
+
+  it('accepts the colours the app accepts and rejects the rest', () => {
+    for (const ok of ['#aabbcc', '#AABBCC', '#abc', '#E54']) expect(TAB_COLOR_RE.test(ok)).toBe(true);
+    for (const bad of ['red', 'aabbcc', '#12345', '#abcd', '#gggggg', '', '#aabbccdd']) {
+      expect(TAB_COLOR_RE.test(bad)).toBe(false);
+    }
+    expect(TAB_TITLE_MAX).toBe(80);
+  });
+
+  it('list_panes reports each pane\'s tabColor next to tabTitle', () => {
+    const pane = { id: 'p1', label: 'one', status: 'running' } as unknown as ControlPane;
+    const state = {
+      windows: [
+        { windowId: 1, activeTabId: 't1', tabs: [{ id: 't1', title: 'T', color: '#aabbcc', layout: 'single', panes: [pane] }] }
+      ]
+    } as unknown as ControlState;
+    const [p] = listPanesResult(state).panes;
+    expect(p?.tabTitle).toBe('T');
+    expect(p?.tabColor).toBe('#aabbcc');
+    const plain = { windows: [{ windowId: 1, activeTabId: 't1', tabs: [{ id: 't1', title: 'T', layout: 'single', panes: [pane] }] }] } as unknown as ControlState;
+    expect(listPanesResult(plain).panes[0]?.tabColor).toBeNull();
   });
 });

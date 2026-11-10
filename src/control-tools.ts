@@ -143,7 +143,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'List panes',
       description:
-        'List all panes across all windows/tabs of the running hyperpanes instance, with status, activity (busy/idle/exited liveness heuristic), any org metadata (role/parent/agentType/task), tab/window context, and the resource URI for streaming each pane\'s output.'
+        'List all panes across all windows/tabs of the running hyperpanes instance, with status, activity (busy/idle/exited liveness heuristic), any org metadata (role/parent/agentType/task), tab/window context (tabId, tabTitle, tabColor), and the resource URI for streaming each pane\'s output.'
     },
     async () =>
       run(async (c) => {
@@ -805,6 +805,39 @@ function registerSpawnWorkers(server: McpServer): void {
       })
   );
 
+  // ---- rename_tab / recolor_tab (live tab chip edits) -------------------
+  server.registerTool(
+    'rename_tab',
+    {
+      title: 'Rename tab',
+      description:
+        'Change a tab\'s title, applied live to the tab strip. Address the tab by the `tabId` list_panes reports. The app trims the title and rejects an empty one.',
+      inputSchema: {
+        tabId: z.string(),
+        title: z.string().max(TAB_TITLE_MAX, `tab title too long (max ${TAB_TITLE_MAX} chars)`)
+      }
+    },
+    async ({ tabId, title }) => run((c) => renameTabResult(c, tabId, title))
+  );
+
+  server.registerTool(
+    'recolor_tab',
+    {
+      title: 'Recolor tab',
+      description:
+        'Set a tab\'s colour (a stripe and tint on its tab chip), applied live and saved with the session. `color` is "#rrggbb" or "#rgb"; null clears it back to the default (or, on a pane-group tab, back to the group\'s project colour, which a manual colour overrides). Address the tab by the `tabId` list_panes reports.',
+      inputSchema: {
+        tabId: z.string(),
+        color: z
+          .string()
+          .regex(TAB_COLOR_RE, 'expected a hex colour like "#e5484d" or "#e54"')
+          .nullable()
+          .describe('"#rrggbb" or "#rgb"; null clears the manual colour')
+      }
+    },
+    async ({ tabId, color }) => run((c) => recolorTabResult(c, tabId, color))
+  );
+
   // ---- send_input (GUARDED — the sharp edge) ---------------------------
   server.registerTool(
     'send_input',
@@ -1266,12 +1299,34 @@ function registerPaneResources(server: McpServer): void {
   });
 }
 
+/** Longest tab title the app accepts (it answers 400 above this). */
+export const TAB_TITLE_MAX = 80;
+
+/** Tab colours the app accepts: `#rgb` or `#rrggbb`, either case (stored as lowercase `#rrggbb`). */
+export const TAB_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+/** rename_tab: maps 1:1 to the app's `renameTab` command. */
+export async function renameTabResult(c: Pick<ControlClient, 'command'>, tabId: string, title: string) {
+  await c.command({ type: 'renameTab', tabId, title });
+  return { ok: true, tabId, title };
+}
+
+/** recolor_tab: maps 1:1 to the app's `recolorTab` command; `null` clears the manual colour. */
+export async function recolorTabResult(
+  c: Pick<ControlClient, 'command'>,
+  tabId: string,
+  color: string | null
+) {
+  await c.command({ type: 'recolorTab', tabId, color });
+  return { ok: true, tabId, color };
+}
+
 /** list_panes output. `app` (running hyperpanes version/build) is included when the app reports it. */
 export function listPanesResult(state: ControlState) {
   return {
     ok: true,
     ...(state.app ? { app: state.app } : {}),
-    panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, layout, activeTab }) => ({
+    panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, tabColor, layout, activeTab }) => ({
         paneId: pane.id,
         label: pane.label,
         // Secondary header line, omitted when unset (set via rename_pane).
@@ -1292,6 +1347,8 @@ export function listPanesResult(state: ControlState) {
         windowId,
         tabId,
         tabTitle,
+        // The tab's manual colour (set via recolor_tab), null when unset.
+        tabColor,
         layout,
         activeTab,
         outputResource: paneOutputUri(pane.id)

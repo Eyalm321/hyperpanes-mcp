@@ -36,7 +36,7 @@ It works at two levels, and you can use either without the other:
 | Tool | Description |
 |---|---|
 | `control_status` | Is the control API reachable? Reports app pid/version, whether the app allows input, the bridge-side `send_input` gate, and the `control.json` path. **Call this first.** |
-| `list_panes` | All panes across windows/tabs, with status, activity (busy/idle/exited), org metadata, tab/window context, and each pane's output-resource URI. |
+| `list_panes` | All panes across windows/tabs, with status, activity (busy/idle/exited), org metadata, tab/window context (`tabId`, `tabTitle`, `tabColor` — the tab's manual colour or `null`), and each pane's output-resource URI. |
 | `read_pane` | A pane's terminal output. `mode:"screen"` = the **rendered cell grid** (clean TUI transcript, no overdraw/spinner spam); `tail` = last N lines; `strip` = ANSI-stripped raw text; `waitForIdle` = **block until the pane goes output-quiet** (`settleMs`/`timeoutMs`) so you read a reply without polling; `since` = a byte cursor for **delta reads** (only new output). Every read returns the current `cursor`. |
 | `read_messages` | Drain a pane's durable message inbox past a cursor (`after` = highest seq seen). |
 | `whoami` | Identify the pane this bridge is running inside (`HYPERPANES_PANE_ID`) and its org metadata — so a manager-agent-in-a-pane can learn who it is before driving sub-workers. |
@@ -52,6 +52,8 @@ It works at two levels, and you can use either without the other:
 | `restart_pane` | Kill and respawn a pane's shell. |
 | `rename_pane` | Change a pane's label and (optionally) subtitle, live. |
 | `recolor_pane` | Change a pane's frame color, live (any CSS color). |
+| `rename_tab` | Change a tab's title, live. Address the tab by the `tabId` from `list_panes`. Maps 1:1 to the app's `renameTab` command; the app trims the title and rejects an empty or over-80-char one. |
+| `recolor_tab` | Set a tab's colour (a stripe and tint on its tab chip), live and saved with the session. `color` is `"#rrggbb"` or `"#rgb"`; `null` clears it. A manual tab colour overrides a pane-group tab's project colour; clearing it shows the group colour again. Maps 1:1 to the app's `recolorTab` command. |
 | `set_meta` | Attach/update a pane's free-form metadata (merge; `null` deletes a key). How an orchestrator records the org chart as data. |
 | `set_talk` | Turn per-pane talk on/off — while enabled, the pane speaks NEW Claude assistant replies aloud via local TTS. Off by default. |
 

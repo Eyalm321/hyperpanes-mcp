@@ -27,6 +27,9 @@ export interface ControlPane {
 export interface ControlTab {
   id: string;
   title: string;
+  // Manual tab colour (lowercase "#rrggbb") set by recolor_tab; null when unset.
+  // Absent on older apps that predate tab colours.
+  color?: string | null;
   layout: string;
   panes: ControlPane[];
 }
@@ -81,6 +84,8 @@ export interface FlatPane {
   windowId: number;
   tabId: string;
   tabTitle: string;
+  /** The tab's manual colour (set via recolor_tab), or null when unset. */
+  tabColor: string | null;
   layout: string;
   /** Whether this pane's tab is the active tab of its window. */
   activeTab: boolean;
@@ -97,6 +102,7 @@ export function flattenPanes(state: ControlState): FlatPane[] {
           windowId: w.windowId,
           tabId: t.id,
           tabTitle: t.title,
+          tabColor: t.color ?? null,
           layout: t.layout,
           activeTab: w.activeTabId === t.id
         });
