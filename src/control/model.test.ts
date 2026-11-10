@@ -45,6 +45,26 @@ describe('flattenPanes', () => {
     expect(flat[3]).toMatchObject({ windowId: 2, tabId: 'tab-c', activeTab: true });
   });
 
+  it('carries the tab colour as tabColor, null when unset or absent (older apps)', () => {
+    const colored: ControlState = {
+      windows: [
+        {
+          windowId: 1,
+          activeTabId: 't1',
+          tabs: [
+            { id: 't1', title: 'a', color: '#aabbcc', layout: 'auto', panes: [{ id: 'p1', sessionUid: 's1', label: 'x', color: '#fff', status: 'running', activity: 'idle' }] },
+            { id: 't2', title: 'b', color: null, layout: 'auto', panes: [{ id: 'p2', sessionUid: 's2', label: 'y', color: '#fff', status: 'running', activity: 'idle' }] }
+          ]
+        }
+      ]
+    };
+    const flat = flattenPanes(colored);
+    expect(flat[0]?.tabColor).toBe('#aabbcc');
+    expect(flat[1]?.tabColor).toBeNull();
+    // A tab without the key at all (an app that predates tab colours) reads as null too.
+    expect(flattenPanes(state)[0]?.tabColor).toBeNull();
+  });
+
   it('carries pane activity + meta through to the flattened pane', () => {
     const flat = flattenPanes(state);
     expect(flat[0]).toMatchObject({ pane: { activity: 'busy' } });
