@@ -18,6 +18,9 @@ import { parseArgs } from 'node:util';
 import { readDiscovery } from '../control/discovery.js';
 import { QueueClient } from '../worker-pool/queue-client.js';
 import { generateBacklog, enqueueBacklog, type GenerateResult } from './backlog.js';
+import { FetchGitHubClient } from '../github/client.js';
+import { resolveConfigPath } from '../github/config.js';
+import { runIssuesIngest } from '../github/ingest.js';
 import { todoSource, jsonFileSource, type BacklogSource } from './sources.js';
 
 const USAGE = `worker-pool backlog generator
@@ -28,6 +31,10 @@ Usage:
 Sources (combine freely; at least one is required):
   --todos                  Scan the repo for TODO/FIXME comments (git grep)
   --tasks <file>           JSON file: an array of tasks, or { "tasks": [...] }
+  --github-issues <r|.>    Open issues labelled for agents in <owner/repo> ('.' = cwd's origin).
+                           Repo must be opted in (see docs/github-sources.md); the repo's
+                           configured queue and base are used, and it can't be combined
+                           with other sources.
 
 Options:
   --dry-run                Print the Tasks that would be enqueued, without POSTing
@@ -36,6 +43,8 @@ Options:
   --base <ref>             Default base ref baked into each task  (env HP_BASE, default "HEAD")
   --markers <a,b>          TODO markers to scan for               (default "TODO,FIXME")
   --limit <n>              Cap tasks emitted by the TODO scan
+  --label <name>           Trigger label for --github-issues      (default from config)
+  --github-config <path>   GitHub opt-in config (env HP_GITHUB_CONFIG)
   --no-dedupe              Keep within-batch duplicate tasks
   -h, --help               Show this help
 
@@ -128,6 +137,38 @@ async function runLive(cfg: BacklogCliConfig, gen: GenerateResult): Promise<void
   process.exitCode = ok === outcomes.length ? 0 : 1;
 }
 
+async function runGithubIssues(
+  repoArg: string,
+  label: string | undefined,
+  configFlag: string | undefined,
+  dryRun: boolean
+): Promise<void> {
+  try {
+    const r = await runIssuesIngest({
+      repoArg,
+      label,
+      configPath: resolveConfigPath(configFlag),
+      dryRun,
+      client: () => new FetchGitHubClient(),
+      queue: () => new QueueClient(readDiscovery())
+    });
+    const summary = {
+      dryRun,
+      repo: r.repo,
+      queue: r.queue,
+      disabled: r.disabled,
+      queueChecked: r.queueChecked,
+      decisions: r.decisions.map((d) => ({ number: d.number, action: d.action, ...(d.reason ? { reason: d.reason } : {}) })),
+      ...(dryRun ? { tasks: r.gen?.items.map((i) => i.request) } : { outcomes: r.outcomes })
+    };
+    console.log(JSON.stringify(summary, null, 2));
+    if (r.outcomes?.some((o) => !o.ok)) process.exitCode = 1;
+  } catch (err) {
+    console.error('[backlog] fatal:', err instanceof Error ? err.message : String(err));
+    process.exitCode = /not opted in|config|token/.test(String(err)) ? 2 : 1;
+  }
+}
+
 export async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
@@ -138,6 +179,9 @@ export async function main(): Promise<void> {
       queue: { type: 'string' },
       base: { type: 'string' },
       markers: { type: 'string' },
+      'github-issues': { type: 'string' },
+      label: { type: 'string' },
+      'github-config': { type: 'string' },
       limit: { type: 'string' },
       'no-dedupe': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' }
@@ -150,6 +194,15 @@ export async function main(): Promise<void> {
   }
 
   const cfg = configFromArgs(values);
+  if (typeof values['github-issues'] === 'string') {
+    if (cfg.todos || cfg.tasksFile) {
+      console.error('[backlog] --github-issues cannot be combined with --todos/--tasks');
+      process.exitCode = 2;
+      return;
+    }
+    await runGithubIssues(values['github-issues'], values.label, values['github-config'], cfg.dryRun);
+    return;
+  }
   const sources = buildSources(cfg);
   if (sources.length === 0) {
     console.error('[backlog] no sources selected — pass --todos and/or --tasks <file> (see --help)');
