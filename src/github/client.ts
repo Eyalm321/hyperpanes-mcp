@@ -70,7 +70,23 @@ export interface WorkflowJob {
   steps: JobStep[];
 }
 
-/** The GitHub surface slices 1-2 need. `repo` is `owner/name`. */
+export interface PullRef {
+  number: number;
+  url: string;
+  state: string;
+  draft: boolean;
+}
+
+export interface CreatePullInput {
+  title: string;
+  /** Branch name (same-repo head). */
+  head: string;
+  base: string;
+  body: string;
+  draft: boolean;
+}
+
+/** The GitHub surface slices 1-3 need. `repo` is `owner/name`. */
 export interface GitHubClient {
   listOpenIssuesByLabel(repo: string, label: string): Promise<GitHubIssue[]>;
   getIssue(repo: string, number: number): Promise<GitHubIssue>;
@@ -87,6 +103,10 @@ export interface GitHubClient {
   getLatestCompletedRun(repo: string, workflowId: number, branch: string): Promise<WorkflowRun | null>;
   /** Jobs (latest attempt) of a run. Never fetches logs. */
   listRunJobs(repo: string, runId: number): Promise<WorkflowJob[]>;
+  /** PRs (any state) whose head is `<headOwner>:<branch>`. Fails closed on an API error. */
+  listPullsByHead(repo: string, headOwner: string, branch: string): Promise<PullRef[]>;
+  /** Open a PR. There is deliberately no merge / approve method anywhere on this interface. */
+  createPull(repo: string, input: CreatePullInput): Promise<{ number: number; url: string }>;
 }
 
 export const NO_TOKEN_MESSAGE = "no GitHub token: set GITHUB_TOKEN or run 'gh auth login'";
@@ -375,6 +395,31 @@ export class FetchGitHubClient implements GitHubClient {
         conclusion: String(st.conclusion ?? '')
       }))
     }));
+  }
+
+  async listPullsByHead(repo: string, headOwner: string, branch: string): Promise<PullRef[]> {
+    const head = encodeURIComponent(`${headOwner}:${branch}`);
+    const rows = await this.#getAll(`/repos/${repo}/pulls?head=${head}&state=all&per_page=100`);
+    return rows.map((j) => ({
+      number: Number(j.number),
+      url: String(j.html_url ?? ''),
+      state: String(j.state ?? ''),
+      draft: j.draft === true
+    }));
+  }
+
+  async createPull(repo: string, input: CreatePullInput): Promise<{ number: number; url: string }> {
+    const r = await this.#request('POST', `${this.#base}/repos/${repo}/pulls`, {
+      title: input.title,
+      head: input.head,
+      base: input.base,
+      body: input.body,
+      draft: input.draft
+    });
+    const d = r.data as Json | null;
+    // fail closed: a reply without a PR number is not a success
+    if (!d || !Number.isInteger(d.number)) throw new GitHubApiError(r.status, 'POST', `/repos/${repo}/pulls`);
+    return { number: Number(d.number), url: String(d.html_url ?? '') };
   }
 
   async listIssueEvents(repo: string, number: number): Promise<IssueEvent[]> {

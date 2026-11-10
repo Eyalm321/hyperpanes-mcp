@@ -5,7 +5,10 @@ import type { GitHubClient } from './client.js';
 import { RateLimitError } from './client.js';
 import type { RepoConfig } from './config.js';
 import { formatMarker, parseMarkers, type MarkerState } from './markers.js';
+import { execGitOps, type GitOps } from './git-ops.js';
+import { defaultStatePath, doneComment, runPrStep, type PrOutcome, type PrTarget } from './pr.js';
 import { listAllTasks, type TaskLister } from './queue.js';
+import { spawnClaudeReviewRunner, type ReviewRunner } from '../worker-pool/review.js';
 
 export const HP_LABELS = ['hp:queued', 'hp:working', 'hp:done', 'hp:failed'] as const;
 
@@ -14,6 +17,8 @@ export interface IssueTask {
   repo: string;
   number: number;
   gen: number;
+  /** Final outcome of the PR step (#6), when it ran. */
+  pr?: Extract<PrOutcome, { final: true }>;
 }
 
 /** Keep only GitHub-issue tasks that name an opted-in repo AND live in that repo's queue. */
@@ -28,6 +33,27 @@ export function selectIssueTasks(tasks: Task[], repo: string, repoCfg: RepoConfi
     const gen = Number(src.gen);
     if (!Number.isFinite(gen)) continue;
     out.push({ task, repo, number: src.number as number, gen });
+  }
+  return out;
+}
+
+export interface CiTask {
+  task: Task;
+  repo: string;
+  runId: number;
+  url: string;
+}
+
+/** GitHub-CI tasks for an opted-in repo, in that repo's queue. */
+export function selectCiTasks(tasks: Task[], repo: string, repoCfg: RepoConfig): CiTask[] {
+  const out: CiTask[] = [];
+  for (const task of tasks) {
+    if (task.queue !== repoCfg.queue) continue;
+    const src = decodeSpec(task).source as Record<string, unknown> | undefined;
+    if (!src || src.kind !== 'github_ci') continue;
+    if (typeof src.repo !== 'string' || src.repo.toLowerCase() !== repo.toLowerCase()) continue;
+    if (!Number.isInteger(src.runId) || (src.runId as number) <= 0) continue;
+    out.push({ task, repo, runId: src.runId as number, url: typeof src.url === 'string' ? src.url : '' });
   }
   return out;
 }
@@ -59,7 +85,12 @@ function desiredLabel(state: Task['state']): (typeof HP_LABELS)[number] {
 }
 
 /** The comment (without marker) this task state warrants, or null. */
-function commentFor(it: IssueTask, triggerLabel: string): { state: MarkerState; text: string } | null {
+function commentFor(
+  it: IssueTask,
+  triggerLabel: string,
+  prEnabled: boolean,
+  draft: boolean
+): { state: MarkerState; text: string } | null {
   const { task } = it;
   const t = id8(task);
   switch (task.state) {
@@ -69,6 +100,10 @@ function commentFor(it: IssueTask, triggerLabel: string): { state: MarkerState; 
         text: `An agent picked this up (task \`${t}\`). Work happens on branch \`${branchName(it.number, task)}\`.`
       };
     case 'done':
+      if (prEnabled) {
+        // post only once the PR step reached a final outcome; the text reflects it
+        return it.pr ? doneComment(it.pr, t, draft) : null;
+      }
       return { state: 'done', text: `Done (task \`${t}\`). The branch stayed local; no PR was opened.` };
     case 'failed':
     case 'dead':
@@ -100,7 +135,7 @@ export function planIssue(tasks: IssueTask[], current: IssueState, cfg: RepoConf
       current.commentBodies.flatMap((b) => parseMarkers(b).map((m) => `${m.task}:${m.state}`))
     );
     for (const it of [...tasks].sort((a, b) => a.task.seq - b.task.seq)) {
-      const c = commentFor(it, cfg.label);
+      const c = commentFor(it, cfg.label, cfg.pr.enabled, cfg.pr.draft);
       if (!c || seen.has(`${it.task.id}:${c.state}`)) continue;
       seen.add(`${it.task.id}:${c.state}`);
       plan.comments.push(`${c.text}\n\n${formatMarker(it.task.id, c.state, it.gen)}`);
@@ -116,7 +151,7 @@ export function planIssue(tasks: IssueTask[], current: IssueState, cfg: RepoConf
 }
 
 export interface SyncAction {
-  kind: 'comment' | 'label';
+  kind: 'comment' | 'label' | 'push' | 'pr';
   number: number;
   detail: string;
 }
@@ -130,6 +165,10 @@ export interface ReconcileOptions {
   /** Called once before the first write for this repo; return false to abort (kill switch). */
   recheck?: () => boolean;
   log?: (line: string) => void;
+  /** PR step seams (#6); defaults: real git, real `claude -p` judge, XDG state file. */
+  git?: (checkout: string) => GitOps;
+  reviewRunner?: ReviewRunner;
+  prStatePath?: string;
 }
 
 export interface ReconcileResult {
@@ -143,9 +182,43 @@ export async function reconcileRepo(o: ReconcileOptions): Promise<ReconcileResul
   const log = o.log ?? ((l) => console.error(l));
   const res: ReconcileResult = { actions: [], errors: [], aborted: false };
   const { repo, repoCfg, client } = o;
-  if (!repoCfg.syncBack.comments && !repoCfg.syncBack.labels) return res;
+  const prOn = repoCfg.pr.enabled;
+  if (!repoCfg.syncBack.comments && !repoCfg.syncBack.labels && !prOn) return res;
 
   const all = await listAllTasks(o.queue, repoCfg.queue);
+  const prDeps = prOn
+    ? {
+        git: (o.git ?? execGitOps)(repoCfg.pr.checkout as string),
+        runner: (o.reviewRunner ??= spawnClaudeReviewRunner()),
+        statePath: o.prStatePath ?? defaultStatePath(),
+        active: o.recheck ?? (() => true)
+      }
+    : undefined;
+  const pushAction = (kind: 'push' | 'pr', detail: string): void => void res.actions.push({ kind, number: 0, detail });
+  const prError = (label: string, out: PrOutcome): void => {
+    if (!out.final && out.error) res.errors.push(`${label}: pr: ${out.error}`);
+  };
+
+  // CI tasks have no issue thread: the PR link lives in the PR body only
+  if (prDeps) {
+    for (const ci of selectCiTasks(all, repo, repoCfg)) {
+      if (ci.task.state !== 'done') continue;
+      try {
+        const out = await runPrStep({
+          client, repo, repoCfg, ...prDeps, comments: [], dryRun: o.dryRun, log, onAction: pushAction,
+          target: { task: ci.task, repo, kind: 'ci', ref: ci.runId, gen: ci.runId, title: ci.task.title, runUrl: ci.url }
+        });
+        prError(`${repo} ci-run ${ci.runId}`, out);
+      } catch (err) {
+        if (err instanceof RateLimitError) {
+          res.rateLimitedUntil = err.resumeAt;
+          return res;
+        }
+        throw err;
+      }
+    }
+  }
+
   const byIssue = new Map<number, IssueTask[]>();
   for (const it of selectIssueTasks(all, repo, repoCfg)) {
     byIssue.set(it.number, [...(byIssue.get(it.number) ?? []), it]);
@@ -156,7 +229,24 @@ export async function reconcileRepo(o: ReconcileOptions): Promise<ReconcileResul
   for (const [number, tasks] of [...byIssue].sort((a, b) => a[0] - b[0])) {
     try {
       const issue = await client.getIssue(repo, number);
-      const comments = repoCfg.syncBack.comments ? await client.listIssueComments(repo, number) : [];
+      const comments =
+        repoCfg.syncBack.comments || prOn ? await client.listIssueComments(repo, number) : [];
+      if (prDeps) {
+        const posted = new Set(comments.flatMap((c) => parseMarkers(c.body).map((m) => `${m.task}:${m.state}`)));
+        for (const it of tasks) {
+          if (it.task.state !== 'done') continue;
+          // the done comment (any slice) already went out: the PR step has nothing left to report
+          if (posted.has(`${it.task.id}:done`)) continue;
+          const target: PrTarget = {
+            task: it.task, repo, kind: 'issue', ref: number, gen: it.gen, title: issue.title
+          };
+          const out = await runPrStep({
+            client, repo, repoCfg, ...prDeps, comments, dryRun: o.dryRun, log, onAction: pushAction, target
+          });
+          if (out.final) it.pr = out;
+          prError(`${repo}#${number}`, out);
+        }
+      }
       const plan = planIssue(tasks, { labels: issue.labels, commentBodies: comments.map((c) => c.body) }, repoCfg);
       if (plan.comments.length || plan.addLabels.length || plan.removeLabels.length) planned.push({ number, plan });
     } catch (err) {

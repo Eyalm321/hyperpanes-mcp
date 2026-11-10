@@ -1,16 +1,18 @@
 /** Test double for {@link GitHubClient}: records every call, no network. Test-only. */
 import type {
+  CreatePullInput,
   GitHubClient,
   GitHubIssue,
   IssueComment,
   IssueEditInfo,
   IssueEvent,
   Permission,
+  PullRef,
   WorkflowJob,
   WorkflowRun
 } from './client.js';
 
-export const WRITE_METHODS = ['createIssueComment', 'addLabels', 'removeLabel'];
+export const WRITE_METHODS = ['createIssueComment', 'addLabels', 'removeLabel', 'createPull'];
 
 export class MockGitHub implements GitHubClient {
   calls: Array<{ method: string; args: unknown[] }> = [];
@@ -22,6 +24,9 @@ export class MockGitHub implements GitHubClient {
   /** every run (any conclusion); listFailedRuns/getLatestCompletedRun derive from it */
   runs: WorkflowRun[] = [];
   jobs = new Map<number, WorkflowJob[]>();
+  pulls: Array<PullRef & { head: string; base: string; title: string; body: string }> = [];
+  /** set to make createPull reject (fail-closed path) */
+  failCreatePull = false;
 
   addRun(r: Partial<WorkflowRun> & { id: number }): WorkflowRun {
     const run: WorkflowRun = {
@@ -123,5 +128,18 @@ export class MockGitHub implements GitHubClient {
   async listRunJobs(repo: string, runId: number) {
     this.rec('listRunJobs', repo, runId);
     return this.jobs.get(runId) ?? [];
+  }
+
+  async listPullsByHead(repo: string, headOwner: string, branch: string) {
+    this.rec('listPullsByHead', repo, headOwner, branch);
+    return this.pulls.filter((p) => p.head === `${headOwner}:${branch}`).map(({ number, url, state, draft }) => ({ number, url, state, draft }));
+  }
+  async createPull(repo: string, input: CreatePullInput) {
+    this.rec('createPull', repo, input);
+    if (this.failCreatePull) throw new Error('GitHub API 422 for POST /pulls');
+    const number = 900 + this.pulls.length;
+    const url = `https://github.com/${repo}/pull/${number}`;
+    this.pulls.push({ number, url, state: 'open', draft: input.draft, head: `${repo.split('/')[0]}:${input.head}`, base: input.base, title: input.title, body: input.body });
+    return { number, url };
   }
 }
