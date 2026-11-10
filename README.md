@@ -307,3 +307,15 @@ node dist/github/cli.js sync [--repo acme/widgets] [--once | --watch 300] [--dry
 ```
 
 Auth: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`.
+
+### Draft PRs on completion (opt-in)
+
+With `"pr": {"enabled": true, "checkout": "/path/to/clone"}` for a repo, `sync` opens a **draft** PR for each finished GitHub task (issue or CI) that left commits on its branch. `pr.checkout` is required when `pr.enabled` is true. Defaults: `draft: true`, `review: true`, `remote: "origin"`.
+
+- The branch is pushed with a plain `git push <remote> <local>:refs/heads/hp/issue-<n>-<id8>` (`hp/ci-<runId>-<id8>` for CI), never `--force`, using the checkout's existing git credentials. The remote must point at the opted-in repo.
+- With `review: true` the local `claude -p` judge reviews `git diff <base>...<branch>` first; a `block` verdict means no push and no PR. The verdict is cached, so the judge does not re-run.
+- A PR that already exists for the branch (open or closed) is reused, not duplicated.
+- **Merge is a human decision.** The tool has no merge, auto-merge or approve capability.
+- The `done` issue comment is posted once the PR step reaches a final outcome and links the PR. CI tasks keep their link in the PR body. Failures are retried next cycle and never posted to GitHub.
+- CI verdicts and outcomes are remembered in `$XDG_STATE_HOME/hyperpanes-mcp/github-sync-state.json` (default `~/.local/state/...`).
+- `--dry-run` prints `would review`, `would push …`, `would open draft PR "…"` and does none of them.

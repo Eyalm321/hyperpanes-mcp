@@ -183,3 +183,26 @@ describe('token never leaks', () => {
     expect(all).not.toContain(SENTINEL);
   });
 });
+
+describe('pull requests (slice 3)', () => {
+  it('listPullsByHead queries head=<owner>:<branch>&state=all and maps rows', async () => {
+    const { client, urls } = mk(() => json([{ number: 7, html_url: 'https://github.com/acme/widgets/pull/7', state: 'closed', draft: true }]));
+    const r = await client.listPullsByHead('acme/widgets', 'acme', 'hp/issue-1-abcd1234');
+    expect(r).toEqual([{ number: 7, url: 'https://github.com/acme/widgets/pull/7', state: 'closed', draft: true }]);
+    expect(urls[0]).toContain('/repos/acme/widgets/pulls?head=acme%3Ahp%2Fissue-1-abcd1234&state=all');
+  });
+  it('listPullsByHead fails closed on 404', async () => {
+    const { client } = mk(() => json({}, {}, 404));
+    await expect(client.listPullsByHead('acme/widgets', 'acme', 'b')).rejects.toThrow();
+  });
+  it('createPull posts the draft PR and returns number/url; failures throw', async () => {
+    let sent: Record<string, unknown> = {};
+    const ok = mk((_u, i) => { sent = JSON.parse(String(i.body)); return json({ number: 9, html_url: 'https://github.com/acme/widgets/pull/9' }, {}, 201); });
+    expect(await ok.client.createPull('acme/widgets', { title: 't', head: 'h', base: 'main', body: 'b', draft: true })).toEqual({ number: 9, url: 'https://github.com/acme/widgets/pull/9' });
+    expect(sent).toEqual({ title: 't', head: 'h', base: 'main', body: 'b', draft: true });
+    const bad = mk(() => json({ message: 'nope' }, {}, 422));
+    await expect(bad.client.createPull('acme/widgets', { title: 't', head: 'h', base: 'main', body: 'b', draft: true })).rejects.toThrow();
+    const empty = mk(() => json({}, {}, 201));
+    await expect(empty.client.createPull('acme/widgets', { title: 't', head: 'h', base: 'main', body: 'b', draft: true })).rejects.toThrow();
+  });
+});
