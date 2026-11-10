@@ -30,8 +30,10 @@ missing, every GitHub command stops with an error before it makes a single API c
 
 ```json
 {
+  "enabled": true,
   "repos": {
     "acme/widgets": {
+      "enabled": true,
       "queue": "widgets-gh",
       "base": "main",
       "label": "agent-ready",
@@ -53,6 +55,11 @@ missing, every GitHub command stops with an error before it makes a single API c
   queue the watcher reads for it. The watcher ignores a task in queue Q that names repo R unless
   `repos[R].queue == Q`, so a task forged into some other queue can't make the tool write to R.
 - Unknown keys are an error (the zod schema is strict), so a typo can't quietly turn a guard off.
+- **Kill switch.** Setting the top-level `enabled: false` stops everything; setting a repo's
+  `enabled: false` stops that repo. Both default to `true`. The config file is read again at the
+  start of every cycle, and again just before each repo's writes, so an edit takes effect on the
+  next write without a restart. A disabled repo gets no reads and no writes; the log says
+  `disabled`.
 
 ## 3. Label filter
 
@@ -123,12 +130,25 @@ paths (see §8).
 - One test uses a sentinel token and asserts it never appears in any payload, stdout, stderr, or
   error message.
 
+**Whose name appears.** Comments, labels, pushes and PRs show up on GitHub as the account that
+owns the token (or the `gh` login). Use a token or account you are happy to have speaking on the
+repo, for example a dedicated bot account with write access to the opted-in repos only.
+
 **Client choice.** The tool uses a small `GitHubClient` interface that tests can mock. The real
 implementation is about 150 lines on Node's built-in `fetch` (REST with `Link`-header paging, plus
 one GraphQL query). The issue says octokit. I chose not to add `@octokit/rest`, which brings about
 15 packages into a server that people run with `npx`, when we need roughly ten endpoints. If you
 want octokit, the interface stays the same and only the implementation changes. Tests never call
 the live API.
+
+**Polling and rate limits.** `sync --watch` defaults to 300 s (5 min); `--watch <secs>` changes
+it, with a 30 s minimum. GET requests use conditional requests: the client keeps each URL's
+`ETag` in memory and sends `If-None-Match`, and a `304` reuses the cached body (GitHub doesn't
+count 304s against the rate limit). On a `429`, or a `403` with `x-ratelimit-remaining: 0`, the
+client waits for `retry-after` or `x-ratelimit-reset`, capped at 15 min, before trying again.
+Otherwise it backs off exponentially from 1 s. Once the budget runs out, the rest of the cycle is
+skipped and the watcher logs when it will resume. One limiter serves the whole process, and dry
+runs go through it too.
 
 ## 6. Dry run (lists every action, writes nothing)
 
@@ -215,8 +235,10 @@ This is the policy #6 asks to have recorded. You decide; these are my proposed d
 - **The PR.** Title is `[hp] <issue title>`, cut to 72 characters. Base is the task's `base`. The
   body has `Closes #<n>` (or the run link for CI tasks), the task id8, the review verdict and risk
   score, the line "Merge is a human decision; this PR is never auto-merged.", and the marker.
-- **Merge.** Never. The code has no merge, auto-merge, or approve call, and a test checks that
-  the client has none. The repo's normal review and branch protection decide the rest.
+- **Merge.** Never. The code has no merge, auto-merge, or approve call. A test reads the built
+  `dist/` output and fails if any merge or approve API path appears (`/merge`,
+  `enablePullRequestAutoMerge`, `mergePullRequest`, `/reviews` with `APPROVE`, `gh pr merge`,
+  `--auto`). The repo's normal review and branch protection decide the rest.
 
 ## 10. Commands
 
@@ -241,7 +263,8 @@ Each slice ships as its own release: a version bump in `package.json` plus both 
 `package-lock.json`.
 
 1. **Slice 1: #3 + #5.** `src/github/{client,config,trust,payload,issues-source,sync,cli}.ts`,
-   the `--github-issues` flag, and tests with a mocked client covering §2–§8.
+   the `--github-issues` flag, the kill switch, the rate limiter, and tests with a mocked client
+   covering §2–§8. The test that scans `dist/` for merge paths ships in this slice.
 2. **Slice 2: #4.** `src/github/ci-source.ts`, the `--github-ci` flag, and tests covering the CI
    rules in §7.
 3. **Slice 3: #6.** The PR step in `sync.ts`, the git push helper, the controller keep-branch
