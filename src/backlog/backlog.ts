@@ -78,7 +78,7 @@ export interface EnqueueOutcome {
  * continues, so a transient error can't strand the remaining tasks.
  */
 export async function enqueueBacklog(
-  client: QueueClient,
+  client: Pick<QueueClient, 'enqueue'>,
   queue: string,
   result: GenerateResult
 ): Promise<EnqueueOutcome[]> {
