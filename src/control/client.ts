@@ -29,6 +29,9 @@ export interface PaneOutput {
   // Rendered-screen reads (C1/C2): the mode served, and the blocked-prompt heuristic.
   mode?: 'raw' | 'screen';
   awaitingInput?: boolean;
+  // Screen reads: the prompt box, or null when the screen has none (undefined from apps or
+  // session daemons older than the field).
+  inputLine?: InputLine | null;
 }
 
 // Read options for `read_pane`. `waitForIdle`/settleMs/timeoutMs make the read
@@ -49,6 +52,18 @@ export interface InboxRead {
   messages: PaneMessage[];
   dropped: number;
   latestSeq: number;
+  // The app's inbox is in-memory: `epoch` names this inbox lifetime and changes when the app
+  // restarts. `reset` = the `after` cursor predates it, so `messages` is the whole backlog.
+  // Absent from apps older than the field.
+  epoch?: number;
+  reset?: boolean;
+}
+
+// What sits in a Claude-Code-style prompt box on a screen read. `suggestion` = every visible
+// character is drawn faint: the agent's own suggested next prompt, which NOBODY typed.
+export interface InputLine {
+  text: string;
+  kind: 'empty' | 'typed' | 'suggestion';
 }
 
 export interface MintedToken {
@@ -160,16 +175,25 @@ export class ControlClient {
     return (await r.json()) as InboxRead;
   }
 
-  async sendMessage(paneId: string, from: string, body: string): Promise<{ ok: boolean; seq: number }> {
+  // `nudge:false` stores the message without the app typing its inbox nudge into the target
+  // pane (for a sender that wakes the receiver itself). Omitted = the app default (nudge).
+  async sendMessage(
+    paneId: string,
+    from: string,
+    body: string,
+    opts: { nudge?: boolean } = {}
+  ): Promise<{ ok: boolean; seq: number; epoch?: number; nudged?: boolean }> {
+    const payload: Record<string, unknown> = { from, body };
+    if (opts.nudge === false) payload.nudge = false;
     const r = await this.req(`/panes/${encodeURIComponent(paneId)}/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ from, body })
+      body: JSON.stringify(payload)
     });
     if (r.status === 404) throw new Error(`no such pane: ${paneId}`);
     if (r.status === 403) throw new Error(`pane out of scope: ${paneId}`);
     if (!r.ok) throw new Error(`message -> ${r.status}`);
-    return (await r.json()) as { ok: boolean; seq: number };
+    return (await r.json()) as { ok: boolean; seq: number; epoch?: number; nudged?: boolean };
   }
 
   // ---- scoping (agent-orchestration F) ----

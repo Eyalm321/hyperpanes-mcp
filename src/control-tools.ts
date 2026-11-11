@@ -158,7 +158,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Read pane output',
       description:
-        'Read a pane\'s terminal output. `mode:"transcript"` (Claude panes only) returns the pane\'s actual CONVERSATION — the last `messages` user/assistant turns from the session transcript on disk, joined via the pane\'s session marker — the reliable way to read a claude pane (TUI screen scrapes are lossy). `mode:"screen"` returns the RENDERED cell grid (what\'s actually on screen — no overdraw, spinner spam, or mangled spacing) instead of the raw pty stream. Default "raw". `tail` limits to the last N lines; `strip` removes ANSI escape codes from a raw read. `waitForIdle` BLOCKS until the pane has been output-quiet for `settleMs` (default 600ms) or `timeoutMs` (default 30000ms) elapses — the way to read a reply without polling/sleeping. `since` is a byte cursor (use the `cursor` from a prior read) that returns only NEW output (raw mode), so you don\'t re-scrape the whole scrollback each turn. Every read returns the current `cursor`. For continuous streaming, subscribe to the pane\'s output resource instead.',
+        'Read a pane\'s terminal output. `mode:"transcript"` (Claude panes only) returns the pane\'s actual CONVERSATION — the last `messages` user/assistant turns from the session transcript on disk, joined via the pane\'s session marker — the reliable way to read a claude pane (TUI screen scrapes are lossy). `mode:"screen"` returns the RENDERED cell grid (what\'s actually on screen — no overdraw, spinner spam, or mangled spacing) instead of the raw pty stream. Default "raw". `tail` limits to the last N lines; `strip` removes ANSI escape codes from a raw read. `waitForIdle` BLOCKS until the pane has been output-quiet for `settleMs` (default 600ms) or `timeoutMs` (default 30000ms) elapses — the way to read a reply without polling/sleeping. `since` is a byte cursor (use the `cursor` from a prior read) that returns only NEW output (raw mode), so you don\'t re-scrape the whole scrollback each turn. Every read returns the current `cursor`. A screen read also returns `inputLine` {text, kind: empty|typed|suggestion} for a Claude-style prompt box (null if none): `suggestion` is the agent\'s own faint ghost text that nobody typed — never relay or submit it as someone\'s input. For continuous streaming, subscribe to the pane\'s output resource instead.',
       inputSchema: {
         paneId: z.string(),
         mode: z
@@ -1064,7 +1064,7 @@ function registerMessagingTools(server: McpServer): void {
     {
       title: 'Read pane messages',
       description:
-        'Read a pane\'s durable message inbox (agent-orchestration E). `after` is a cursor — pass the highest seq you have seen to get only newer messages. `dropped` reports how many were evicted by the per-pane cap. For live delivery, subscribe to the pane\'s messages resource instead of polling.',
+        'Read a pane\'s durable message inbox (agent-orchestration E). `after` is a cursor — pass the highest seq you have seen to get only newer messages. `dropped` reports how many were evicted by the per-pane cap. The inbox is in-memory and starts over (seq back at 1) when the app restarts: `epoch` names the current inbox, and `reset:true` means your `after` cursor predates it, so `messages` is the whole backlog — re-base your cursor on `latestSeq`. For live delivery, subscribe to the pane\'s messages resource instead of polling.',
       inputSchema: {
         paneId: z.string(),
         after: z.number().int().nonnegative().optional()
@@ -1079,18 +1079,28 @@ function registerMessagingTools(server: McpServer): void {
     {
       title: 'Send a message to a pane',
       description:
-        'Enqueue a structured message to a pane\'s durable inbox (agent-orchestration E). Delivered at-least-once; the target reads it via read_messages or its messages resource. `from` should identify the sender (your paneId, or an orchestrator label).',
+        'Enqueue a structured message to a pane\'s durable inbox (agent-orchestration E). Delivered at-least-once; the target reads it via read_messages or its messages resource. `from` should identify the sender (your paneId, or an orchestrator label). An org pane (role goals-orch/spec, or hp.nudge=on) also gets a one-line inbox nudge typed in when idle; pass `nudge:false` only when you wake the target yourself some other way, so one message does not cost it two turns.',
       inputSchema: {
         to: z.string().describe('target paneId'),
         body: z.string(),
-        from: z.string().optional().describe('sender id; defaults to this bridge\'s HYPERPANES_PANE_ID or "orchestrator"')
+        from: z.string().optional().describe('sender id; defaults to this bridge\'s HYPERPANES_PANE_ID or "orchestrator"'),
+        nudge: z
+          .boolean()
+          .optional()
+          .describe('false = store the message but do not type the inbox nudge into the target pane (default: the app nudges org panes)')
       }
     },
-    async ({ to, body, from }) =>
+    async ({ to, body, from, nudge }) =>
       run(async (c) => {
         const sender = from ?? process.env.HYPERPANES_PANE_ID ?? 'orchestrator';
-        const sent = await c.sendMessage(to, sender, body);
-        return { ok: true, to, from: sender, seq: sent.seq };
+        const sent = await c.sendMessage(to, sender, body, nudge === false ? { nudge: false } : {});
+        return {
+          ok: true,
+          to,
+          from: sender,
+          seq: sent.seq,
+          ...(sent.nudged === undefined ? {} : { nudged: sent.nudged })
+        };
       })
   );
 

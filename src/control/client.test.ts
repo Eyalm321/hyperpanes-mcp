@@ -81,3 +81,29 @@ describe('ControlClient project methods', () => {
     expect(init?.method).toBe('DELETE');
   });
 });
+
+describe('ControlClient message bus (t36)', () => {
+  it('sendMessage omits nudge by default so the app keeps its nudge', async () => {
+    const fn = stubFetch(200, { ok: true, seq: 3, epoch: 9, nudged: true });
+    const out = await new ControlClient(discovery).sendMessage('p1', 'me', 'hi');
+    expect(out).toEqual({ ok: true, seq: 3, epoch: 9, nudged: true });
+    const [url, init] = fn.mock.calls[0]!;
+    expect(url).toBe('http://127.0.0.1:6123/panes/p1/messages');
+    expect(JSON.parse(init?.body as string)).toEqual({ from: 'me', body: 'hi' });
+  });
+
+  it('sendMessage sends nudge:false only when asked', async () => {
+    const fn = stubFetch(200, { ok: true, seq: 4, nudged: false });
+    await new ControlClient(discovery).sendMessage('p1', 'me', 'hi', { nudge: false });
+    expect(JSON.parse(fn.mock.calls[0]![1]?.body as string)).toEqual({ from: 'me', body: 'hi', nudge: false });
+    await new ControlClient(discovery).sendMessage('p1', 'me', 'hi', { nudge: true });
+    expect(JSON.parse(fn.mock.calls[1]![1]?.body as string)).toEqual({ from: 'me', body: 'hi' });
+  });
+
+  it('readMessages passes epoch and reset through', async () => {
+    const body = { paneId: 'p1', messages: [], dropped: 0, latestSeq: 1, epoch: 5, reset: true };
+    const fn = stubFetch(200, body);
+    expect(await new ControlClient(discovery).readMessages('p1', 48)).toEqual(body);
+    expect(fn.mock.calls[0]![0]).toBe('http://127.0.0.1:6123/panes/p1/messages?after=48');
+  });
+});
