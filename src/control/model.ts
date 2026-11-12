@@ -197,6 +197,8 @@ export interface WhoAmI {
   windowId: number;
   tabId: string;
   tabTitle: string;
+  /** The pane's tab rollup status (see tabStatusOf). */
+  tabStatus: 'working' | 'idle';
 }
 
 /** Resolve a pane's self-description from /state. Pure — the env paneId is read
@@ -214,7 +216,8 @@ export function resolveWhoami(state: ControlState, paneId: string): WhoAmI | nul
     meta,
     windowId: found.windowId,
     tabId: found.tabId,
-    tabTitle: found.tabTitle
+    tabTitle: found.tabTitle,
+    tabStatus: found.tabStatus
   };
 }
 

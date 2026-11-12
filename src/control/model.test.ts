@@ -157,7 +157,8 @@ describe('resolveWhoami', () => {
       meta: { role: 'manager:frontend', parent: 'ceo', agentType: 'claude', task: 'ship' },
       windowId: 1,
       tabId: 't',
-      tabTitle: 'team'
+      tabTitle: 'team',
+      tabStatus: 'working'
     });
   });
 
