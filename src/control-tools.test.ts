@@ -5,6 +5,8 @@ import {
   listPanesResult,
   pickBuild,
   renameTabResult,
+  movePaneResult,
+  projectTabField,
   recolorTabResult,
   openTabResult,
   TAB_COLOR_RE,
@@ -203,5 +205,61 @@ describe('open_tab group colour', () => {
     expect(GroupSpecSchema.safeParse({ title: 'a', color: null, panes: [] }).success).toBe(true);
     expect(GroupSpecSchema.safeParse({ title: 'a', panes: [] }).success).toBe(true);
     expect(GroupSpecSchema.safeParse({ title: 'a', color: 'red', panes: [] }).success).toBe(false);
+  });
+});
+
+describe('move_pane / projectTab', () => {
+  const recorder = (result: unknown) => {
+    const sent: unknown[] = [];
+    const c = {
+      command: async (cmd: unknown) => {
+        sent.push(cmd);
+        return { ok: true, result };
+      }
+    } as never;
+    return { c, sent };
+  };
+
+  it('sends movePane with exactly the given target and returns the tabId', async () => {
+    const { c, sent } = recorder({ tabId: 'tab-1' });
+    const r = await movePaneResult(c, { paneId: 'p1', tabId: '1:0' });
+    expect(sent).toEqual([{ type: 'movePane', paneId: 'p1', tabId: '1:0' }]);
+    expect(r).toEqual({ ok: true, paneId: 'p1', tabId: 'tab-1' });
+  });
+
+  it('passes newTab / project with an optional windowId', async () => {
+    const { c, sent } = recorder({ tabId: 'new' });
+    await movePaneResult(c, { paneId: 'p1', newTab: { title: 'proj-a', color: '#a855f7' }, windowId: 2 });
+    await movePaneResult(c, { paneId: 'p1', project: 'proj-a' });
+    expect(sent).toEqual([
+      { type: 'movePane', paneId: 'p1', newTab: { title: 'proj-a', color: '#a855f7' }, windowId: 2 },
+      { type: 'movePane', paneId: 'p1', project: 'proj-a' }
+    ]);
+  });
+
+  it('needs exactly one target, and sends nothing otherwise', async () => {
+    const { c, sent } = recorder({ tabId: 'x' });
+    await expect(movePaneResult(c, { paneId: 'p1' })).rejects.toThrow('exactly one');
+    await expect(movePaneResult(c, { paneId: 'p1', tabId: 't', project: 'p' })).rejects.toThrow('exactly one');
+    expect(sent).toEqual([]);
+  });
+
+  it('surfaces the app error and a missing tabId', async () => {
+    const failing = {
+      command: async () => {
+        throw new Error('command movePane -> 409 (pane p1 is the only pane in its window)');
+      }
+    } as never;
+    await expect(movePaneResult(failing, { paneId: 'p1', newTab: {} })).rejects.toThrow('409');
+    const { c } = recorder(undefined);
+    await expect(movePaneResult(c, { paneId: 'p1', newTab: {} })).rejects.toThrow('no tabId');
+  });
+
+  it('projectTab is only sent when set and needs project', () => {
+    expect(projectTabField(undefined, undefined)).toEqual({});
+    expect(projectTabField('proj-a', undefined)).toEqual({});
+    expect(projectTabField('proj-a', true)).toEqual({ projectTab: true });
+    expect(projectTabField(undefined, false)).toEqual({ projectTab: false });
+    expect(() => projectTabField(undefined, true)).toThrow('projectTab needs project');
   });
 });
