@@ -9,6 +9,7 @@ import {
   projectTabField,
   newPaneTarget,
   callerPlacement,
+  commandWithDefaultedTab,
   tabPlacementWarning,
   recolorTabResult,
   openTabResult,
@@ -372,5 +373,74 @@ describe('open_pane / spawn_workers tabId', () => {
     expect(tabPlacementWarning(state, 'new', 'proj')).toBeUndefined();
     expect(tabPlacementWarning(state, 'missing', 'proj')).toBeUndefined();
     expect(tabPlacementWarning(state, 'old', 'proj')).toMatch(/ignored tabId.*lead/);
+  });
+});
+
+describe('a defaulted caller tab never breaks an older app', () => {
+  const app = (reject: (cmd: Record<string, unknown>) => string | undefined) => {
+    const sent: Record<string, unknown>[] = [];
+    const c = {
+      command: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        const err = reject(cmd);
+        if (err) throw new Error(err);
+        return { ok: true, result: 'p1' };
+      }
+    } as never;
+    return { c, sent };
+  };
+  const cmd = { type: 'newPane', windowId: 1, tabId: 'mine', pane: {} };
+  const tabRejected = (c: Record<string, unknown>) =>
+    c.tabId !== undefined ? 'command newPane -> 400 (unknown field tabId)' : undefined;
+
+  it('retries once without a DEFAULTED tabId the app rejects, and logs it', async () => {
+    const { c, sent } = app(tabRejected);
+    const logs: string[] = [];
+    const r = await commandWithDefaultedTab(c, cmd, true, (m) => logs.push(m));
+    expect(sent).toEqual([cmd, { type: 'newPane', windowId: 1, pane: {} }]);
+    expect(r.tabId).toBeUndefined();
+    expect(r.res.result).toBe('p1');
+    expect(logs[0]).toMatch(/retrying in the window's active tab/);
+  });
+
+  it('an EXPLICIT tabId keeps failing clearly, with no retry', async () => {
+    const { c, sent } = app(tabRejected);
+    await expect(commandWithDefaultedTab(c, cmd, false, () => {})).rejects.toThrow('-> 400 (unknown field tabId)');
+    expect(sent).toHaveLength(1);
+  });
+
+  it('does not retry unrelated failures, and passes an accepted tabId through', async () => {
+    const boom = app(() => 'command newPane -> 500 (spawn failed)');
+    await expect(commandWithDefaultedTab(boom.c, cmd, true, () => {})).rejects.toThrow('500');
+    expect(boom.sent).toHaveLength(1);
+    const okApp = app(() => undefined);
+    const r = await commandWithDefaultedTab(okApp.c, cmd, true, () => {});
+    expect(r.tabId).toBe('mine');
+    expect(okApp.sent).toEqual([cmd]);
+  });
+
+  it('open_tab as:"panes" falls back to the active tab when attach rejects the caller tab', async () => {
+    const sent: unknown[] = [];
+    const c = {
+      state: async () => ({
+        windows: [{ windowId: 1, activeTabId: 'a', tabs: [{ id: 'a', title: 'a', layout: 'auto', panes: [{ id: 'me' }] }, { id: 'b', title: 'b', layout: 'auto', panes: [{ id: 'caller' }] }] }]
+      }),
+      command: async (x: Record<string, unknown>) => {
+        sent.push(x);
+        if (x.tabId) throw new Error('command attach -> 400 (no such tab: b)');
+        return { ok: true, result: ['n1'] };
+      }
+    } as never;
+    const g = [{ panes: [{ command: 'true' }] }];
+    const errSpy = console.error;
+    console.error = () => {};
+    try {
+      const r = await openTabResult(c, g, 'panes', undefined, undefined, 'caller');
+      expect(r).toEqual({ ok: true, windowId: 1, as: 'panes', ids: ['n1'] });
+      await expect(openTabResult(c, g, 'panes', undefined, 'b', 'caller')).rejects.toThrow('400');
+    } finally {
+      console.error = errSpy;
+    }
+    expect(sent).toHaveLength(3);
   });
 });

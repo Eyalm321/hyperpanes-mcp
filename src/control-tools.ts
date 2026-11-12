@@ -15,6 +15,7 @@ import {
   resolveWhoami,
   subtreePaneIds,
   type ControlState,
+  type ControlCommand,
   type AppInfo
 } from './control/model.js';
 import { checkInputAllowed, readInputGate } from './control/input-gate.js';
@@ -263,11 +264,16 @@ export function registerControlTools(server: McpServer): void {
         const place = newPaneTarget(state, windowId, tabId, projectTab, process.env.HYPERPANES_PANE_ID);
         if (place.windowId == null) throw new Error('no windows open to add a pane to');
         const target = place.windowId;
-        const res = await c.command({
-          type: 'newPane',
-          ...place,
-          pane: { label, command, args, cwd, shell, color, meta, env, project, ...projectTabField(project, projectTab) }
-        });
+        const defaulted = tabId === undefined && place.tabId !== undefined;
+        const { res, tabId: sentTab } = await commandWithDefaultedTab(
+          c,
+          {
+            type: 'newPane',
+            ...place,
+            pane: { label, command, args, cwd, shell, color, meta, env, project, ...projectTabField(project, projectTab) }
+          },
+          defaulted
+        );
         // The app returns the new pane id via the command round-trip (D). A
         // missing id means the round-trip failed (a timed-out/wedged renderer now
         // surfaces as a 5xx that c.command throws, but guard the resultless case
@@ -279,11 +285,11 @@ export function registerControlTools(server: McpServer): void {
         // waitForPane). `ready:false` means it didn't appear in time (rare); the
         // pane still exists, the read-model just lagged unusually.
         const ready = await c.waitForPane(paneId);
-        const warning = tabId ? tabPlacementWarning(await c.state(), paneId, tabId) : undefined;
+        const warning = sentTab ? tabPlacementWarning(await c.state(), paneId, sentTab) : undefined;
         return {
           ok: true,
           windowId: target,
-          ...(place.tabId ? { tabId: place.tabId } : {}),
+          ...(sentTab ? { tabId: sentTab } : {}),
           paneId,
           ready,
           ...(warning ? { warning } : {})
@@ -525,25 +531,37 @@ function registerSpawnWorkers(server: McpServer): void {
         validateAccountsRotation(perPane, n, accounts);
         const paneMeta = workerPaneMeta(meta, process.env.HYPERPANES_PANE_ID, queue);
         const paneIds: string[] = [];
+        // A defaulted (caller's) tab the app rejects is dropped once, for every later pane too.
+        let placeNow: { windowId: number | undefined; tabId?: string } = place;
+        let defaulted = tabId === undefined && place.tabId !== undefined;
         for (let i = 0; i < panes; i++) {
           const label = panes > 1 ? `workers:${queue}#${i + 1}` : `workers:${queue}`;
           const paneEnv = workerPaneEnv(i, perPane, env, accounts);
-          const res = await c.command({
-            type: 'newPane',
-            ...place,
-            pane: {
-              label,
-              command: bin,
-              args: argsFor(i),
-              cwd,
-              color,
-              ...(paneEnv ? { env: paneEnv } : {}),
-              meta: paneMeta,
-              ...(project !== undefined ? { project } : {}),
-              ...projectTabField(project, projectTab),
-              ...(subtitle !== undefined ? { subtitle } : {})
-            }
-          });
+          const sent = await commandWithDefaultedTab(
+            c,
+            {
+              type: 'newPane',
+              ...placeNow,
+              pane: {
+                label,
+                command: bin,
+                args: argsFor(i),
+                cwd,
+                color,
+                ...(paneEnv ? { env: paneEnv } : {}),
+                meta: paneMeta,
+                ...(project !== undefined ? { project } : {}),
+                ...projectTabField(project, projectTab),
+                ...(subtitle !== undefined ? { subtitle } : {})
+              }
+            },
+            defaulted
+          );
+          const res = sent.res;
+          if (sent.tabId === undefined && placeNow.tabId !== undefined) {
+            placeNow = { windowId: placeNow.windowId };
+            defaulted = false;
+          }
           const paneId = typeof res.result === 'string' ? res.result : undefined;
           if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
           paneIds.push(paneId);
@@ -551,7 +569,7 @@ function registerSpawnWorkers(server: McpServer): void {
         const first = paneIds[0];
         if (!first) throw new Error('no worker panes were spawned');
         const ready = await c.waitForPane(first);
-        const warning = tabId ? tabPlacementWarning(await c.state(), first, tabId) : undefined;
+        const warning = placeNow.tabId ? tabPlacementWarning(await c.state(), first, placeNow.tabId) : undefined;
         return {
           ...(warning ? { warning } : {}),
           ok: true,
@@ -562,7 +580,7 @@ function registerSpawnWorkers(server: McpServer): void {
           stream: stream ?? false,
           logDir: logDir ?? null,
           windowId: target,
-          ...(place.tabId ? { tabId: place.tabId } : {}),
+          ...(placeNow.tabId ? { tabId: placeNow.tabId } : {}),
           paneIds,
           ready
         };
@@ -1389,15 +1407,14 @@ export async function openTabResult(
   if (target == null) throw new Error('no windows open to attach to');
   // The app returns the new tab ids (unit:'tab') or pane ids (unit:'panes')
   // via the command round-trip (D), mirroring newPane → id.
-  const res = await c.command({
-    type: 'attach',
-    windowId: target,
-    ...(place.tabId ? { tabId: place.tabId } : {}),
-    groups,
-    as: unit
-  });
+  const defaulted = tabId === undefined && place.tabId !== undefined;
+  const { res, tabId: sentTab } = await commandWithDefaultedTab(
+    c,
+    { type: 'attach', windowId: target, ...(place.tabId ? { tabId: place.tabId } : {}), groups, as: unit },
+    defaulted
+  );
   const ids = Array.isArray(res.result) ? (res.result as string[]) : [];
-  return { ok: true, windowId: target, ...(place.tabId ? { tabId: place.tabId } : {}), as: unit, ids };
+  return { ok: true, windowId: target, ...(sentTab ? { tabId: sentTab } : {}), as: unit, ids };
 }
 
 /** rename_tab: maps 1:1 to the app's `renameTab` command. */
@@ -1463,6 +1480,30 @@ export function tabPlacementWarning(state: ControlState, paneId: string, tabId: 
   const at = flattenPanes(state).find((p) => p.pane.id === paneId);
   if (!at || at.tabId === tabId) return undefined;
   return `the app ignored tabId (it predates newPane tabId support): the pane opened in tab ${at.tabId}; move_pane it if needed`;
+}
+
+/**
+ * Send a placed newPane/attach. When the `tabId` on it was only DEFAULTED to the caller's tab
+ * (the caller asked for no placement), an app that rejects it (a 4xx naming tabId: no tabId
+ * support, or the caller's tab outside the token's scope) must not fail the call: retry once
+ * without the tabId, i.e. the old active-tab placement, and log it. An explicit tabId is never
+ * retried; its error surfaces as before. Returns the response and the tabId actually sent.
+ */
+export async function commandWithDefaultedTab(
+  c: Pick<ControlClient, 'command'>,
+  cmd: ControlCommand & { tabId?: string },
+  defaulted: boolean,
+  log: (msg: string) => void = (m) => console.error(m)
+): Promise<{ res: { ok: boolean; result?: unknown }; tabId?: string }> {
+  try {
+    return { res: await c.command(cmd), tabId: cmd.tabId };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!defaulted || cmd.tabId === undefined || !/-> 4\d\d/.test(msg) || !/tab/i.test(msg)) throw e;
+    log(`hyperpanes-mcp: ${cmd.type} rejected the caller's tab (${msg}); retrying in the window's active tab`);
+    const { tabId: _drop, ...rest } = cmd;
+    return { res: await c.command(rest as ControlCommand) };
+  }
 }
 
 /** The `projectTab` field of a newPane spec: only sent when set, and never without `project`. */
