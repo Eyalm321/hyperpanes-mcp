@@ -31,6 +31,9 @@ export interface ControlTab {
   // Absent on older apps that predate tab colours.
   color?: string | null;
   layout: string;
+  // Tab-level rollup: 'working' iff any pane is busy. Absent on older apps;
+  // use tabStatusOf() to get a value either way.
+  status?: 'working' | 'idle';
   panes: ControlPane[];
 }
 
@@ -79,6 +82,13 @@ export interface PaneMessage {
   ts: number;
 }
 
+/** A tab's status: the app's own `status` when sent, else derived the same way
+ *  (working iff ANY pane is busy; idle/exited panes and empty tabs are idle). */
+export function tabStatusOf(tab: ControlTab): 'working' | 'idle' {
+  if (tab.status === 'working' || tab.status === 'idle') return tab.status;
+  return tab.panes.some((p) => p.activity === 'busy') ? 'working' : 'idle';
+}
+
 export interface FlatPane {
   pane: ControlPane;
   windowId: number;
@@ -86,6 +96,8 @@ export interface FlatPane {
   tabTitle: string;
   /** The tab's manual colour (set via recolor_tab), or null when unset. */
   tabColor: string | null;
+  /** The tab's rollup status (see tabStatusOf). */
+  tabStatus: 'working' | 'idle';
   layout: string;
   /** Whether this pane's tab is the active tab of its window. */
   activeTab: boolean;
@@ -103,6 +115,7 @@ export function flattenPanes(state: ControlState): FlatPane[] {
           tabId: t.id,
           tabTitle: t.title,
           tabColor: t.color ?? null,
+          tabStatus: tabStatusOf(t),
           layout: t.layout,
           activeTab: w.activeTabId === t.id
         });

@@ -143,7 +143,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'List panes',
       description:
-        'List all panes across all windows/tabs of the running hyperpanes instance, with status, activity (busy/idle/exited liveness heuristic), any org metadata (role/parent/agentType/task), tab/window context (tabId, tabTitle, tabColor), and the resource URI for streaming each pane\'s output.'
+        'List all panes across all windows/tabs of the running hyperpanes instance, with status, activity (busy/idle/exited liveness heuristic), any org metadata (role/parent/agentType/task), tab/window context (tabId, tabTitle, tabColor, tabStatus: working iff any pane in the tab is busy, else idle), and the resource URI for streaming each pane\'s output.'
     },
     async () =>
       run(async (c) => {
@@ -1418,7 +1418,7 @@ export function listPanesResult(state: ControlState) {
   return {
     ok: true,
     ...(state.app ? { app: state.app } : {}),
-    panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, tabColor, layout, activeTab }) => ({
+    panes: flattenPanes(state).map(({ pane, windowId, tabId, tabTitle, tabColor, tabStatus, layout, activeTab }) => ({
         paneId: pane.id,
         label: pane.label,
         // Secondary header line, omitted when unset (set via rename_pane).
@@ -1441,6 +1441,8 @@ export function listPanesResult(state: ControlState) {
         tabTitle,
         // The tab's manual colour (set via recolor_tab), null when unset.
         tabColor,
+        // Tab rollup: 'working' iff any pane in the tab is busy.
+        tabStatus,
         layout,
         activeTab,
         outputResource: paneOutputUri(pane.id)
