@@ -7,6 +7,8 @@ import {
   renameTabResult,
   movePaneResult,
   projectTabField,
+  newPaneTarget,
+  tabPlacementWarning,
   recolorTabResult,
   openTabResult,
   TAB_COLOR_RE,
@@ -261,5 +263,39 @@ describe('move_pane / projectTab', () => {
     expect(projectTabField('proj-a', true)).toEqual({ projectTab: true });
     expect(projectTabField(undefined, false)).toEqual({ projectTab: false });
     expect(() => projectTabField(undefined, true)).toThrow('projectTab needs project');
+  });
+});
+
+describe('open_pane / spawn_workers tabId', () => {
+  const pane = (id: string) => ({ id }) as unknown as ControlPane;
+  const tab = (id: string, panes: ControlPane[] = []) =>
+    ({ id, title: id, layout: 'auto', panes }) as never;
+  const state = {
+    windows: [
+      { windowId: 1, activeTabId: 'lead', tabs: [tab('lead', [pane('old')]), tab('proj', [pane('new')])] },
+      { windowId: 2, activeTabId: 'w2', tabs: [tab('w2')] }
+    ]
+  } as unknown as ControlState;
+
+  it('without tabId targets windowId (default: the first window) and sends no tabId', () => {
+    expect(newPaneTarget(state, undefined, undefined, undefined)).toEqual({ windowId: 1 });
+    expect(newPaneTarget(state, 2, undefined, true)).toEqual({ windowId: 2 });
+  });
+
+  it('with tabId sends the tab and its own window', () => {
+    expect(newPaneTarget(state, undefined, 'proj', undefined)).toEqual({ windowId: 1, tabId: 'proj' });
+    expect(newPaneTarget(state, 2, 'w2', false)).toEqual({ windowId: 2, tabId: 'w2' });
+  });
+
+  it('rejects an unknown tab, a contradicting windowId, and tabId with projectTab', () => {
+    expect(() => newPaneTarget(state, undefined, 'nope', undefined)).toThrow('unknown tabId');
+    expect(() => newPaneTarget(state, 2, 'proj', undefined)).toThrow('not window 2');
+    expect(() => newPaneTarget(state, undefined, 'proj', true)).toThrow('exclusive');
+  });
+
+  it('warns only when the pane landed outside the requested tab', () => {
+    expect(tabPlacementWarning(state, 'new', 'proj')).toBeUndefined();
+    expect(tabPlacementWarning(state, 'missing', 'proj')).toBeUndefined();
+    expect(tabPlacementWarning(state, 'old', 'proj')).toMatch(/ignored tabId.*lead/);
   });
 });

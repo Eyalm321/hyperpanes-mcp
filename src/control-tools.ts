@@ -253,17 +253,19 @@ export function registerControlTools(server: McpServer): void {
           .boolean()
           .optional()
           .describe(PROJECT_TAB_DESC),
+        tabId: z.string().optional().describe(TAB_ID_DESC),
         windowId: z.number().int().optional()
       }
     },
-    async ({ command, args, label, cwd, shell, color, meta, env, project, projectTab, windowId }) =>
+    async ({ command, args, label, cwd, shell, color, meta, env, project, projectTab, tabId, windowId }) =>
       run(async (c) => {
         const state = await c.state();
-        const target = windowId ?? firstWindowId(state);
-        if (target == null) throw new Error('no windows open to add a pane to');
+        const place = newPaneTarget(state, windowId, tabId, projectTab);
+        if (place.windowId == null) throw new Error('no windows open to add a pane to');
+        const target = place.windowId;
         const res = await c.command({
           type: 'newPane',
-          windowId: target,
+          ...place,
           pane: { label, command, args, cwd, shell, color, meta, env, project, ...projectTabField(project, projectTab) }
         });
         // The app returns the new pane id via the command round-trip (D). A
@@ -277,7 +279,8 @@ export function registerControlTools(server: McpServer): void {
         // waitForPane). `ready:false` means it didn't appear in time (rare); the
         // pane still exists, the read-model just lagged unusually.
         const ready = await c.waitForPane(paneId);
-        return { ok: true, windowId: target, paneId, ready };
+        const warning = tabId ? tabPlacementWarning(await c.state(), paneId, tabId) : undefined;
+        return { ok: true, windowId: target, paneId, ready, ...(warning ? { warning } : {}) };
       })
   );
 
@@ -469,6 +472,7 @@ function registerSpawnWorkers(server: McpServer): void {
           .optional()
           .describe('open worker panes in a remembered project (see list_projects): defaults cwd + color from it'),
         projectTab: z.boolean().optional().describe(PROJECT_TAB_DESC),
+        tabId: z.string().optional().describe(TAB_ID_DESC),
         subtitle: z.string().optional().describe('secondary header line set on every worker pane'),
         windowId: z.number().int().optional()
       }
@@ -490,13 +494,15 @@ function registerSpawnWorkers(server: McpServer): void {
       meta,
       project,
       projectTab,
+      tabId,
       subtitle,
       windowId
     }) =>
       run(async (c) => {
         const state = await c.state();
-        const target = windowId ?? firstWindowId(state);
-        if (target == null) throw new Error('no windows open to add a worker pane to');
+        const place = newPaneTarget(state, windowId, tabId, projectTab);
+        if (place.windowId == null) throw new Error('no windows open to add a worker pane to');
+        const target = place.windowId;
         const bin = process.env.HYPERPANES_WORKER_BIN ?? 'hyperpanes';
         const n = count ?? 1;
         // One pane per worker by default: N agents multiplexed into a single pane interleave
@@ -517,7 +523,7 @@ function registerSpawnWorkers(server: McpServer): void {
           const paneEnv = workerPaneEnv(i, perPane, env, accounts);
           const res = await c.command({
             type: 'newPane',
-            windowId: target,
+            ...place,
             pane: {
               label,
               command: bin,
@@ -538,7 +544,9 @@ function registerSpawnWorkers(server: McpServer): void {
         const first = paneIds[0];
         if (!first) throw new Error('no worker panes were spawned');
         const ready = await c.waitForPane(first);
+        const warning = tabId ? tabPlacementWarning(await c.state(), first, tabId) : undefined;
         return {
+          ...(warning ? { warning } : {}),
           ok: true,
           queue,
           count: n,
@@ -1368,6 +1376,40 @@ export async function renameTabResult(c: Pick<ControlClient, 'command'>, tabId: 
 /** The `projectTab` description shared by open_pane and spawn_workers. */
 const PROJECT_TAB_DESC =
   "with `project`: open the pane in that project's tab (reused if the window has one, else created with the project's name and colour) instead of the caller's tab. Opt-in; needs a hyperpanes app with `projectTab` support";
+
+/** The `tabId` description shared by open_pane and spawn_workers. */
+const TAB_ID_DESC =
+  "open the pane directly in this existing tab (a tabId from list_panes) instead of the window's active tab — nothing opens elsewhere first, so never open_pane then move_pane. Exclusive with projectTab; `windowId` is optional and must match the tab's window. Needs a hyperpanes app with newPane `tabId` support; an older app opens it in the active tab and the result carries a `warning`";
+
+/**
+ * The placement fields of a newPane command. With `tabId` the pane is spawned straight into that
+ * tab (its window is looked up, and a contradicting `windowId` is an error); otherwise into
+ * `windowId`'s active tab, defaulting to the first window. `windowId` is always sent, so an app
+ * without `tabId` support still accepts the command (and the caller warns, see
+ * `tabPlacementWarning`).
+ */
+export function newPaneTarget(
+  state: ControlState,
+  windowId: number | undefined,
+  tabId: string | undefined,
+  projectTab: boolean | undefined
+): { windowId: number | undefined; tabId?: string } {
+  if (tabId === undefined) return { windowId: windowId ?? firstWindowId(state) };
+  if (projectTab) throw new Error('tabId and projectTab are exclusive: pass one');
+  const win = resolveWindowIdForTab(state, tabId);
+  if (win === undefined) throw new Error(`unknown tabId: ${tabId}`);
+  if (windowId !== undefined && windowId !== win) {
+    throw new Error(`tabId ${tabId} is in window ${win}, not window ${windowId}`);
+  }
+  return { windowId: win, tabId };
+}
+
+/** A warning when a pane asked for `tabId` landed elsewhere (an app without newPane `tabId`). */
+export function tabPlacementWarning(state: ControlState, paneId: string, tabId: string): string | undefined {
+  const at = flattenPanes(state).find((p) => p.pane.id === paneId);
+  if (!at || at.tabId === tabId) return undefined;
+  return `the app ignored tabId (it predates newPane tabId support): the pane opened in tab ${at.tabId}; move_pane it if needed`;
+}
 
 /** The `projectTab` field of a newPane spec: only sent when set, and never without `project`. */
 export function projectTabField(project: string | undefined, projectTab: boolean | undefined) {
