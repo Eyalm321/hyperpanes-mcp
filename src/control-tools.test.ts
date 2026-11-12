@@ -8,6 +8,7 @@ import {
   movePaneResult,
   projectTabField,
   newPaneTarget,
+  callerPlacement,
   tabPlacementWarning,
   recolorTabResult,
   openTabResult,
@@ -202,6 +203,60 @@ describe('open_tab group colour', () => {
     expect(r).toEqual({ ok: true, windowId: 3, as: 'tab', ids: ['tab-1'] });
   });
 
+  const twoTabs = {
+    windows: [
+      {
+        windowId: 1,
+        activeTabId: 'lead',
+        tabs: [
+          { id: 'lead', title: 'lead', layout: 'auto', panes: [{ id: 'other' }] },
+          { id: 'mine', title: 'mine', layout: 'auto', panes: [{ id: 'me' }] }
+        ]
+      },
+      { windowId: 2, activeTabId: 'w2', tabs: [{ id: 'w2', title: 'w2', layout: 'auto', panes: [{ id: 'far' }] }] }
+    ]
+  };
+  const attachRecorder = () => {
+    const sent: unknown[] = [];
+    const c = {
+      state: async () => twoTabs,
+      command: async (cmd: unknown) => {
+        sent.push(cmd);
+        return { ok: true, result: ['x'] };
+      }
+    } as never;
+    return { c, sent };
+  };
+  const g = [{ panes: [{ command: 'true' }] }];
+
+  it('as:"panes" merges into the caller\'s own tab, not the active one', async () => {
+    const { c, sent } = attachRecorder();
+    const r = await openTabResult(c, g, 'panes', undefined, undefined, 'me');
+    expect(sent).toEqual([{ type: 'attach', windowId: 1, tabId: 'mine', groups: g, as: 'panes' }]);
+    expect(r).toMatchObject({ windowId: 1, tabId: 'mine', as: 'panes' });
+  });
+
+  it('as:"panes" honours an explicit tabId or windowId over the caller', async () => {
+    const { c, sent } = attachRecorder();
+    await openTabResult(c, g, 'panes', undefined, 'w2', 'me');
+    await openTabResult(c, g, 'panes', 1, undefined, 'me');
+    expect(sent).toEqual([
+      { type: 'attach', windowId: 2, tabId: 'w2', groups: g, as: 'panes' },
+      { type: 'attach', windowId: 1, groups: g, as: 'panes' }
+    ]);
+  });
+
+  it('as:"tab" opens in the caller\'s window; outside hyperpanes in the first window', async () => {
+    const { c, sent } = attachRecorder();
+    await openTabResult(c, g, 'tab', undefined, undefined, 'far');
+    await openTabResult(c, g, undefined, undefined, undefined, undefined);
+    expect(sent).toEqual([
+      { type: 'attach', windowId: 2, groups: g, as: 'tab' },
+      { type: 'attach', windowId: 1, groups: g, as: 'tab' }
+    ]);
+    await expect(openTabResult(c, g, 'tab', undefined, 'mine', 'me')).rejects.toThrow('tabId needs as:"panes"');
+  });
+
   it('the open_tab group schema takes color next to title (hex or null) and rejects bad ones', () => {
     expect(GroupSpecSchema.safeParse({ title: 'a', color: '#abc', panes: [] }).success).toBe(true);
     expect(GroupSpecSchema.safeParse({ title: 'a', color: null, panes: [] }).success).toBe(true);
@@ -276,6 +331,26 @@ describe('open_pane / spawn_workers tabId', () => {
       { windowId: 2, activeTabId: 'w2', tabs: [tab('w2')] }
     ]
   } as unknown as ControlState;
+
+  it('with no placement at all opens in the caller\'s own tab, even a background one', () => {
+    expect(newPaneTarget(state, undefined, undefined, undefined, 'new')).toEqual({ windowId: 1, tabId: 'proj' });
+    expect(newPaneTarget(state, undefined, undefined, undefined, 'old')).toEqual({ windowId: 1, tabId: 'lead' });
+  });
+
+  it('explicit options win over the caller\'s tab', () => {
+    expect(newPaneTarget(state, undefined, 'w2', undefined, 'new')).toEqual({ windowId: 2, tabId: 'w2' });
+    expect(newPaneTarget(state, 2, undefined, undefined, 'new')).toEqual({ windowId: 2 });
+    expect(newPaneTarget(state, 1, undefined, undefined, 'new')).toEqual({ windowId: 1 });
+    // projectTab picks the tab; it still opens in the caller's window.
+    expect(newPaneTarget(state, undefined, undefined, true, 'new')).toEqual({ windowId: 1 });
+  });
+
+  it('a caller outside hyperpanes or not in the state keeps the old default', () => {
+    expect(newPaneTarget(state, undefined, undefined, undefined, undefined)).toEqual({ windowId: 1 });
+    expect(newPaneTarget(state, undefined, undefined, undefined, 'ghost')).toEqual({ windowId: 1 });
+    expect(callerPlacement(state, 'ghost')).toBeUndefined();
+    expect(callerPlacement(state, undefined)).toBeUndefined();
+  });
 
   it('without tabId targets windowId (default: the first window) and sends no tabId', () => {
     expect(newPaneTarget(state, undefined, undefined, undefined)).toEqual({ windowId: 1 });
