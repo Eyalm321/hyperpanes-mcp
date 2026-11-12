@@ -249,10 +249,14 @@ export function registerControlTools(server: McpServer): void {
           .describe(
             'open the pane in a remembered project (its id or name; see list_projects): defaults cwd + frame color from the project and bumps its recency. An explicit cwd/color still wins; an unknown handle fails the call.'
           ),
+        projectTab: z
+          .boolean()
+          .optional()
+          .describe(PROJECT_TAB_DESC),
         windowId: z.number().int().optional()
       }
     },
-    async ({ command, args, label, cwd, shell, color, meta, env, project, windowId }) =>
+    async ({ command, args, label, cwd, shell, color, meta, env, project, projectTab, windowId }) =>
       run(async (c) => {
         const state = await c.state();
         const target = windowId ?? firstWindowId(state);
@@ -260,7 +264,7 @@ export function registerControlTools(server: McpServer): void {
         const res = await c.command({
           type: 'newPane',
           windowId: target,
-          pane: { label, command, args, cwd, shell, color, meta, env, project }
+          pane: { label, command, args, cwd, shell, color, meta, env, project, ...projectTabField(project, projectTab) }
         });
         // The app returns the new pane id via the command round-trip (D). A
         // missing id means the round-trip failed (a timed-out/wedged renderer now
@@ -464,6 +468,7 @@ function registerSpawnWorkers(server: McpServer): void {
           .string()
           .optional()
           .describe('open worker panes in a remembered project (see list_projects): defaults cwd + color from it'),
+        projectTab: z.boolean().optional().describe(PROJECT_TAB_DESC),
         subtitle: z.string().optional().describe('secondary header line set on every worker pane'),
         windowId: z.number().int().optional()
       }
@@ -484,6 +489,7 @@ function registerSpawnWorkers(server: McpServer): void {
       accounts,
       meta,
       project,
+      projectTab,
       subtitle,
       windowId
     }) =>
@@ -521,6 +527,7 @@ function registerSpawnWorkers(server: McpServer): void {
               ...(paneEnv ? { env: paneEnv } : {}),
               meta: paneMeta,
               ...(project !== undefined ? { project } : {}),
+              ...projectTabField(project, projectTab),
               ...(subtitle !== undefined ? { subtitle } : {})
             }
           });
@@ -825,6 +832,33 @@ function registerSpawnWorkers(server: McpServer): void {
       }
     },
     async ({ tabId, color }) => run((c) => recolorTabResult(c, tabId, color))
+  );
+
+  // ---- move_pane (re-host a live pane in another tab / window) ---------
+  server.registerTool(
+    'move_pane',
+    {
+      title: 'Move pane',
+      description:
+        'Move a LIVE pane to another tab, in the same window or another one, without restarting it: the pty, session, paneId, label, subtitle, meta and inbox are untouched; only its tab changes. Give exactly one target: `tabId` (an existing tab, as list_panes reports it), `newTab` ({title?, color?}: a new background tab), or `project` (a remembered project id, name or absolute path: that project\'s tab in the window, reused if present, else created with the project\'s name and colour). `windowId` picks the window for `newTab`/`project` (default: the pane\'s own). Returns the target `tabId`. A tab emptied by the move closes; the window\'s only pane cannot move (409). Needs a hyperpanes app with the `movePane` command.',
+      inputSchema: {
+        paneId: z.string(),
+        tabId: z.string().optional().describe('an existing tab to move into'),
+        newTab: z
+          .object({
+            title: z.string().max(TAB_TITLE_MAX, `tab title too long (max ${TAB_TITLE_MAX} chars)`).optional(),
+            color: z.string().regex(TAB_COLOR_RE, 'expected a hex colour like "#e5484d" or "#e54"').optional()
+          })
+          .optional()
+          .describe('move into a brand-new tab (opened in the background)'),
+        project: z
+          .string()
+          .optional()
+          .describe("move into the project's tab (id, name or absolute path; see list_projects)"),
+        windowId: z.number().int().optional().describe('window for newTab/project (default: the pane\'s own)')
+      }
+    },
+    async (args) => run((c) => movePaneResult(c, args))
   );
 
   // ---- send_input (GUARDED — the sharp edge) ---------------------------
@@ -1329,6 +1363,44 @@ export async function openTabResult(
 export async function renameTabResult(c: Pick<ControlClient, 'command'>, tabId: string, title: string) {
   await c.command({ type: 'renameTab', tabId, title });
   return { ok: true, tabId, title };
+}
+
+/** The `projectTab` description shared by open_pane and spawn_workers. */
+const PROJECT_TAB_DESC =
+  "with `project`: open the pane in that project's tab (reused if the window has one, else created with the project's name and colour) instead of the caller's tab. Opt-in; needs a hyperpanes app with `projectTab` support";
+
+/** The `projectTab` field of a newPane spec: only sent when set, and never without `project`. */
+export function projectTabField(project: string | undefined, projectTab: boolean | undefined) {
+  if (projectTab === undefined) return {};
+  if (projectTab && project === undefined) throw new Error('projectTab needs project');
+  return { projectTab };
+}
+
+export type MovePaneArgs = {
+  paneId: string;
+  tabId?: string;
+  newTab?: { title?: string; color?: string };
+  project?: string;
+  windowId?: number;
+};
+
+/** move_pane: maps 1:1 to the app's `movePane` command (exactly one of tabId/newTab/project). */
+export async function movePaneResult(c: Pick<ControlClient, 'command'>, args: MovePaneArgs) {
+  const { paneId, tabId, newTab, project, windowId } = args;
+  const targets = [tabId, newTab, project].filter((t) => t !== undefined).length;
+  if (targets !== 1) throw new Error('move_pane needs exactly one of tabId, newTab, project');
+  const res = await c.command({
+    type: 'movePane',
+    paneId,
+    ...(tabId !== undefined ? { tabId } : {}),
+    ...(newTab !== undefined ? { newTab } : {}),
+    ...(project !== undefined ? { project } : {}),
+    ...(windowId !== undefined ? { windowId } : {})
+  });
+  const r = res.result as { tabId?: unknown } | undefined;
+  const target = typeof r?.tabId === 'string' ? r.tabId : undefined;
+  if (!target) throw new Error('app accepted movePane but returned no tabId');
+  return { ok: true, paneId, tabId: target };
 }
 
 /** recolor_tab: maps 1:1 to the app's `recolorTab` command; `null` clears the manual colour. */

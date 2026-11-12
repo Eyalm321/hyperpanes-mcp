@@ -45,7 +45,7 @@ It works at two levels, and you can use either without the other:
 
 | Tool | Description |
 |---|---|
-| `open_pane` | Open a new pane in a window's active tab (defaults to the first window). Returns the new `paneId`; accepts `meta` (org metadata) and `env` (e.g. a scoped token) at spawn. Pass `args` (a string array) to run `command` **directly** with that verbatim argv — no shell, no re-parse — the reliable way to pass arguments containing spaces/quotes (e.g. `command:"claude", args:["--append-system-prompt","…persona…"]`). |
+| `open_pane` | Open a new pane in a window's active tab (defaults to the first window). Returns the new `paneId`; accepts `meta` (org metadata) and `env` (e.g. a scoped token) at spawn. `project` + `projectTab:true` opens the pane in that project's tab (reused or created) instead of the active one; `spawn_workers` takes the same pair. Pass `args` (a string array) to run `command` **directly** with that verbatim argv — no shell, no re-parse — the reliable way to pass arguments containing spaces/quotes (e.g. `command:"claude", args:["--append-system-prompt","…persona…"]`). |
 | `open_tab` | Attach one or more new tabs to a window, each with fresh shells; returns the new tab ids (`as:"panes"` merges the panes into the active tab instead). Each group is `{ title?, color?, layout?, panes }`: a group `color` (`"#rrggbb"`/`"#rgb"`) is the new tab's manual colour, the same one `recolor_tab` sets; a pane `color` is that pane's frame colour. |
 | `set_layout` | Set a tab's tiling layout (defaults to the first window's active tab). |
 | `focus_pane` | Focus a pane (and its tab/window). |
@@ -55,6 +55,7 @@ It works at two levels, and you can use either without the other:
 | `recolor_pane` | Change a pane's frame color, live (any CSS color). |
 | `rename_tab` | Change a tab's title, live. Address the tab by the `tabId` from `list_panes`. Maps 1:1 to the app's `renameTab` command; the app trims the title and rejects an empty or over-80-char one. |
 | `recolor_tab` | Set a tab's colour (a stripe and tint on its tab chip), live and saved with the session. `color` is `"#rrggbb"` or `"#rgb"`; `null` clears it. A manual tab colour overrides a pane-group tab's project colour; clearing it shows the group colour again. Maps 1:1 to the app's `recolorTab` command. |
+| `move_pane` | Move a **live** pane to another tab or window without restarting it (same pty, session, `paneId`, label, subtitle, meta, inbox). Exactly one target: `tabId`, `newTab` (`{title?, color?}`, opened in the background) or `project` (id, name or absolute path: that project's tab, reused or created with the project's name and colour). `windowId` picks the window for `newTab`/`project`. Returns the target `tabId`. Maps 1:1 to the app's `movePane` command. |
 | `set_meta` | Attach/update a pane's free-form metadata (merge; `null` deletes a key). How an orchestrator records the org chart as data. |
 | `set_talk` | Turn per-pane talk on/off — while enabled, the pane speaks NEW Claude assistant replies aloud via local TTS. Off by default. |
 
