@@ -15,6 +15,7 @@ import {
   resolveWhoami,
   subtreePaneIds,
   type ControlState,
+  type ControlCommand,
   type AppInfo
 } from './control/model.js';
 import { checkInputAllowed, readInputGate } from './control/input-gate.js';
@@ -221,7 +222,7 @@ export function registerControlTools(server: McpServer): void {
     {
       title: 'Open pane',
       description:
-        'Open a new pane in the active tab of a window (defaults to the first window). Returns the new paneId. `command` alone runs through the shell. Pass `args` (a string array) to run `command` DIRECTLY as the executable with that exact argv — no shell, no re-parse — which is the reliable way to pass arguments containing spaces or quotes (e.g. command:"claude", args:["--append-system-prompt","…long persona…"]); a single `command` string with such args gets mangled by the shell. `meta` attaches free-form org metadata (reserved keys: role/parent/agentType/task) so the new worker is self-describing. `project` opens the pane in a remembered project (see list_projects/add_project): it defaults the pane\'s cwd + frame color from that project and bumps its recency in the sidebar rail.',
+        'Open a new pane. With no tabId/projectTab/windowId it opens beside the caller, in the calling pane\'s own tab (HYPERPANES_PANE_ID); outside hyperpanes, or with only `windowId`, it opens in that window\'s active tab (default: the first window). Returns the new paneId. `command` alone runs through the shell. Pass `args` (a string array) to run `command` DIRECTLY as the executable with that exact argv — no shell, no re-parse — which is the reliable way to pass arguments containing spaces or quotes (e.g. command:"claude", args:["--append-system-prompt","…long persona…"]); a single `command` string with such args gets mangled by the shell. `meta` attaches free-form org metadata (reserved keys: role/parent/agentType/task) so the new worker is self-describing. `project` opens the pane in a remembered project (see list_projects/add_project): it defaults the pane\'s cwd + frame color from that project and bumps its recency in the sidebar rail.',
       inputSchema: {
         command: z.string().optional(),
         args: z
@@ -260,14 +261,19 @@ export function registerControlTools(server: McpServer): void {
     async ({ command, args, label, cwd, shell, color, meta, env, project, projectTab, tabId, windowId }) =>
       run(async (c) => {
         const state = await c.state();
-        const place = newPaneTarget(state, windowId, tabId, projectTab);
+        const place = newPaneTarget(state, windowId, tabId, projectTab, process.env.HYPERPANES_PANE_ID);
         if (place.windowId == null) throw new Error('no windows open to add a pane to');
         const target = place.windowId;
-        const res = await c.command({
-          type: 'newPane',
-          ...place,
-          pane: { label, command, args, cwd, shell, color, meta, env, project, ...projectTabField(project, projectTab) }
-        });
+        const defaulted = tabId === undefined && place.tabId !== undefined;
+        const { res, tabId: sentTab } = await commandWithDefaultedTab(
+          c,
+          {
+            type: 'newPane',
+            ...place,
+            pane: { label, command, args, cwd, shell, color, meta, env, project, ...projectTabField(project, projectTab) }
+          },
+          defaulted
+        );
         // The app returns the new pane id via the command round-trip (D). A
         // missing id means the round-trip failed (a timed-out/wedged renderer now
         // surfaces as a 5xx that c.command throws, but guard the resultless case
@@ -279,8 +285,15 @@ export function registerControlTools(server: McpServer): void {
         // waitForPane). `ready:false` means it didn't appear in time (rare); the
         // pane still exists, the read-model just lagged unusually.
         const ready = await c.waitForPane(paneId);
-        const warning = tabId ? tabPlacementWarning(await c.state(), paneId, tabId) : undefined;
-        return { ok: true, windowId: target, paneId, ready, ...(warning ? { warning } : {}) };
+        const warning = sentTab ? tabPlacementWarning(await c.state(), paneId, sentTab) : undefined;
+        return {
+          ok: true,
+          windowId: target,
+          ...(sentTab ? { tabId: sentTab } : {}),
+          paneId,
+          ready,
+          ...(warning ? { warning } : {})
+        };
       })
   );
 
@@ -407,7 +420,7 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Spawn worker pool',
       description:
-        'Spawn a pool of queue workers in one call (#6). Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo) and REQUIRES `base` — the explicit committish each task worktree forks from, passed to the runner as `--base` (the call fails without it). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). `env`/`accounts`/`meta`/`project`/`subtitle` pass through to each worker pane spec — merge order: `env` is the shared base, `accounts[i % len]` sets each pane\'s CLAUDE_CONFIG_DIR and wins over `env` (rotation requires `layout:"pane-per-worker"` when count > 1; single-pane shares one process env, so the call fails loudly). Every worker pane is stamped with default org meta role="worker", task="queue:<queue>", parent=<this bridge\'s pane> (so worker send_to_parent works out of the box); caller `meta` wins over those defaults. Returns the spawned pane ids.',
+        'Spawn a pool of queue workers in one call (#6). Worker panes open beside the caller (in the calling pane\'s tab) unless `tabId`, `projectTab` or `windowId` says otherwise. Opens pane(s) running the native `hyperpanes worker` runner bound to `queue`: it claims tasks and runs `command` (via `sh -c`, so $HP_TASK_PAYLOAD / $HP_TASK_ID / $HP_FENCING_TOKEN / $HP_QUEUE are in the environment) for each, acking on exit 0 and nacking on non-zero, until the queue drains — then the pane exits. `count` = how many competing workers; by default each gets ITS OWN pane (`layout:"pane-per-worker"`) so you can watch one agent per pane — pass `layout:"single-pane"` for the legacy one-pane-runs-N behaviour. `isolation:"worktree"` runs each task in a throwaway git worktree that auto-removes (needs `cwd` to be a git repo) and REQUIRES `base` — the explicit committish each task worktree forks from, passed to the runner as `--base` (the call fails without it). `stream:true` renders a Claude child\'s `--output-format stream-json` events as readable progress instead of the silence a bare `claude -p` gives you; `logDir` tees each task\'s raw output to a file that outlives the pane; `lingerSecs` keeps the pane open after the queue drains. The runner binary defaults to `hyperpanes` on PATH (override with HYPERPANES_WORKER_BIN on the bridge). `env`/`accounts`/`meta`/`project`/`subtitle` pass through to each worker pane spec — merge order: `env` is the shared base, `accounts[i % len]` sets each pane\'s CLAUDE_CONFIG_DIR and wins over `env` (rotation requires `layout:"pane-per-worker"` when count > 1; single-pane shares one process env, so the call fails loudly). Every worker pane is stamped with default org meta role="worker", task="queue:<queue>", parent=<this bridge\'s pane> (so worker send_to_parent works out of the box); caller `meta` wins over those defaults. Returns the spawned pane ids.',
       inputSchema: {
         queue: z.string().describe('the work queue to drain'),
         command: z
@@ -500,7 +513,7 @@ function registerSpawnWorkers(server: McpServer): void {
     }) =>
       run(async (c) => {
         const state = await c.state();
-        const place = newPaneTarget(state, windowId, tabId, projectTab);
+        const place = newPaneTarget(state, windowId, tabId, projectTab, process.env.HYPERPANES_PANE_ID);
         if (place.windowId == null) throw new Error('no windows open to add a worker pane to');
         const target = place.windowId;
         const bin = process.env.HYPERPANES_WORKER_BIN ?? 'hyperpanes';
@@ -518,25 +531,37 @@ function registerSpawnWorkers(server: McpServer): void {
         validateAccountsRotation(perPane, n, accounts);
         const paneMeta = workerPaneMeta(meta, process.env.HYPERPANES_PANE_ID, queue);
         const paneIds: string[] = [];
+        // A defaulted (caller's) tab the app rejects is dropped once, for every later pane too.
+        let placeNow: { windowId: number | undefined; tabId?: string } = place;
+        let defaulted = tabId === undefined && place.tabId !== undefined;
         for (let i = 0; i < panes; i++) {
           const label = panes > 1 ? `workers:${queue}#${i + 1}` : `workers:${queue}`;
           const paneEnv = workerPaneEnv(i, perPane, env, accounts);
-          const res = await c.command({
-            type: 'newPane',
-            ...place,
-            pane: {
-              label,
-              command: bin,
-              args: argsFor(i),
-              cwd,
-              color,
-              ...(paneEnv ? { env: paneEnv } : {}),
-              meta: paneMeta,
-              ...(project !== undefined ? { project } : {}),
-              ...projectTabField(project, projectTab),
-              ...(subtitle !== undefined ? { subtitle } : {})
-            }
-          });
+          const sent = await commandWithDefaultedTab(
+            c,
+            {
+              type: 'newPane',
+              ...placeNow,
+              pane: {
+                label,
+                command: bin,
+                args: argsFor(i),
+                cwd,
+                color,
+                ...(paneEnv ? { env: paneEnv } : {}),
+                meta: paneMeta,
+                ...(project !== undefined ? { project } : {}),
+                ...projectTabField(project, projectTab),
+                ...(subtitle !== undefined ? { subtitle } : {})
+              }
+            },
+            defaulted
+          );
+          const res = sent.res;
+          if (sent.tabId === undefined && placeNow.tabId !== undefined) {
+            placeNow = { windowId: placeNow.windowId };
+            defaulted = false;
+          }
           const paneId = typeof res.result === 'string' ? res.result : undefined;
           if (!paneId) throw new Error('app accepted newPane but returned no pane id (renderer reply lost?)');
           paneIds.push(paneId);
@@ -544,7 +569,7 @@ function registerSpawnWorkers(server: McpServer): void {
         const first = paneIds[0];
         if (!first) throw new Error('no worker panes were spawned');
         const ready = await c.waitForPane(first);
-        const warning = tabId ? tabPlacementWarning(await c.state(), first, tabId) : undefined;
+        const warning = placeNow.tabId ? tabPlacementWarning(await c.state(), first, placeNow.tabId) : undefined;
         return {
           ...(warning ? { warning } : {}),
           ok: true,
@@ -555,6 +580,7 @@ function registerSpawnWorkers(server: McpServer): void {
           stream: stream ?? false,
           logDir: logDir ?? null,
           windowId: target,
+          ...(placeNow.tabId ? { tabId: placeNow.tabId } : {}),
           paneIds,
           ready
         };
@@ -567,14 +593,21 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Open tab(s)',
       description:
-        'Attach one or more new tabs to an existing window (defaults to the first window), each with fresh shells — the programmatic equivalent of `hyperpanes --attach`. Returns the new tab ids. Use this (not open_pane) to add a whole tab, or several tabs, in one call. Pass `as:"panes"` to instead merge ALL the given panes into the window\'s ACTIVE tab (returns the new pane ids). Each group is one tab: { title?, color?, layout?, panes:[{ command?, args?, label?, cwd?, shell?, color?, meta? }] }. A group `color` ("#rrggbb"/"#rgb") is the new tab\'s manual colour, the same one recolor_tab sets (it overrides a pane-group colour); a pane `color` is that pane\'s frame colour.',
+        'Attach one or more new tabs to an existing window (defaults to the first window), each with fresh shells — the programmatic equivalent of `hyperpanes --attach`. Returns the new tab ids. Use this (not open_pane) to add a whole tab, or several tabs, in one call. Pass `as:"panes"` to instead merge ALL the given panes into one existing tab (returns the new pane ids): `tabId` if given, else the calling pane\'s own tab when no `windowId` is given either, else the window\'s ACTIVE tab. With no `windowId`, new tabs open in the calling pane\'s window. Each group is one tab: { title?, color?, layout?, panes:[{ command?, args?, label?, cwd?, shell?, color?, meta? }] }. A group `color` ("#rrggbb"/"#rgb") is the new tab\'s manual colour, the same one recolor_tab sets (it overrides a pane-group colour); a pane `color` is that pane\'s frame colour.',
       inputSchema: {
         groups: z.array(GroupSpecSchema).min(1),
         as: z.enum(['tab', 'panes']).optional(),
+        tabId: z
+          .string()
+          .optional()
+          .describe(
+            'with as:"panes": merge the panes into this existing tab (a tabId from list_panes) instead of the active one. Needs a hyperpanes app with attach `tabId` support; an older app merges them into the active tab'
+          ),
         windowId: z.number().int().optional()
       }
     },
-    async ({ groups, as, windowId }) => run((c) => openTabResult(c, groups, as, windowId))
+    async ({ groups, as, tabId, windowId }) =>
+      run((c) => openTabResult(c, groups, as, windowId, tabId, process.env.HYPERPANES_PANE_ID))
   );
 
   // ---- projects (the remembered-directory registry / sidebar rail) -----
@@ -1354,17 +1387,34 @@ export async function openTabResult(
   c: Pick<ControlClient, 'state' | 'command'>,
   groups: GroupSpec[],
   as?: 'tab' | 'panes',
-  windowId?: number
+  windowId?: number,
+  tabId?: string,
+  callerPaneId?: string
 ) {
   const state = await c.state();
-  const target = windowId ?? firstWindowId(state);
-  if (target == null) throw new Error('no windows open to attach to');
   const unit = as ?? 'tab';
+  if (tabId !== undefined && unit !== 'panes') throw new Error('tabId needs as:"panes"');
+  // as:"panes" lands in an existing tab: `tabId`, else (no windowId) the caller's own tab.
+  // New tabs (as:"tab") open in the caller's window. Outside hyperpanes: the first window.
+  let place: { windowId: number | undefined; tabId?: string };
+  if (unit === 'panes') {
+    place = newPaneTarget(state, windowId, tabId, undefined, callerPaneId);
+  } else {
+    const caller = windowId === undefined ? callerPlacement(state, callerPaneId) : undefined;
+    place = { windowId: windowId ?? caller?.windowId ?? firstWindowId(state) };
+  }
+  const target = place.windowId;
+  if (target == null) throw new Error('no windows open to attach to');
   // The app returns the new tab ids (unit:'tab') or pane ids (unit:'panes')
   // via the command round-trip (D), mirroring newPane → id.
-  const res = await c.command({ type: 'attach', windowId: target, groups, as: unit });
+  const defaulted = tabId === undefined && place.tabId !== undefined;
+  const { res, tabId: sentTab } = await commandWithDefaultedTab(
+    c,
+    { type: 'attach', windowId: target, ...(place.tabId ? { tabId: place.tabId } : {}), groups, as: unit },
+    defaulted
+  );
   const ids = Array.isArray(res.result) ? (res.result as string[]) : [];
-  return { ok: true, windowId: target, as: unit, ids };
+  return { ok: true, windowId: target, ...(sentTab ? { tabId: sentTab } : {}), as: unit, ids };
 }
 
 /** rename_tab: maps 1:1 to the app's `renameTab` command. */
@@ -1379,12 +1429,28 @@ const PROJECT_TAB_DESC =
 
 /** The `tabId` description shared by open_pane and spawn_workers. */
 const TAB_ID_DESC =
-  "open the pane directly in this existing tab (a tabId from list_panes) instead of the window's active tab — nothing opens elsewhere first, so never open_pane then move_pane. Exclusive with projectTab; `windowId` is optional and must match the tab's window. Needs a hyperpanes app with newPane `tabId` support; an older app opens it in the active tab and the result carries a `warning`";
+  "open the pane directly in this existing tab (a tabId from list_panes) instead of the caller's tab (or, with only `windowId`, that window's active tab) — nothing opens elsewhere first, so never open_pane then move_pane. Exclusive with projectTab; `windowId` is optional and must match the tab's window. Needs a hyperpanes app with newPane `tabId` support; an older app opens it in the active tab and the result carries a `warning`";
+
+/**
+ * Where the calling pane lives: the window + tab of `callerPaneId` (this bridge's
+ * HYPERPANES_PANE_ID) in the app state. Undefined outside hyperpanes, or when the caller is not
+ * visible (unknown id, or a scoped token that cannot see its own pane).
+ */
+export function callerPlacement(
+  state: ControlState,
+  callerPaneId: string | undefined
+): { windowId: number; tabId: string } | undefined {
+  if (!callerPaneId) return undefined;
+  const at = flattenPanes(state).find((p) => p.pane.id === callerPaneId);
+  return at ? { windowId: at.windowId, tabId: at.tabId } : undefined;
+}
 
 /**
  * The placement fields of a newPane command. With `tabId` the pane is spawned straight into that
- * tab (its window is looked up, and a contradicting `windowId` is an error); otherwise into
- * `windowId`'s active tab, defaulting to the first window. `windowId` is always sent, so an app
+ * tab (its window is looked up, and a contradicting `windowId` is an error). With no placement at
+ * all (no tabId, projectTab or windowId) it opens beside the caller: in the calling pane's tab
+ * (`callerPaneId`, this bridge's HYPERPANES_PANE_ID). Otherwise into `windowId`'s active tab,
+ * defaulting to the caller's window, then the first window. `windowId` is always sent, so an app
  * without `tabId` support still accepts the command (and the caller warns, see
  * `tabPlacementWarning`).
  */
@@ -1392,9 +1458,14 @@ export function newPaneTarget(
   state: ControlState,
   windowId: number | undefined,
   tabId: string | undefined,
-  projectTab: boolean | undefined
+  projectTab: boolean | undefined,
+  callerPaneId?: string
 ): { windowId: number | undefined; tabId?: string } {
-  if (tabId === undefined) return { windowId: windowId ?? firstWindowId(state) };
+  if (tabId === undefined) {
+    const caller = windowId === undefined ? callerPlacement(state, callerPaneId) : undefined;
+    if (caller && !projectTab) return caller;
+    return { windowId: windowId ?? caller?.windowId ?? firstWindowId(state) };
+  }
   if (projectTab) throw new Error('tabId and projectTab are exclusive: pass one');
   const win = resolveWindowIdForTab(state, tabId);
   if (win === undefined) throw new Error(`unknown tabId: ${tabId}`);
@@ -1409,6 +1480,30 @@ export function tabPlacementWarning(state: ControlState, paneId: string, tabId: 
   const at = flattenPanes(state).find((p) => p.pane.id === paneId);
   if (!at || at.tabId === tabId) return undefined;
   return `the app ignored tabId (it predates newPane tabId support): the pane opened in tab ${at.tabId}; move_pane it if needed`;
+}
+
+/**
+ * Send a placed newPane/attach. When the `tabId` on it was only DEFAULTED to the caller's tab
+ * (the caller asked for no placement), an app that rejects it (a 4xx naming tabId: no tabId
+ * support, or the caller's tab outside the token's scope) must not fail the call: retry once
+ * without the tabId, i.e. the old active-tab placement, and log it. An explicit tabId is never
+ * retried; its error surfaces as before. Returns the response and the tabId actually sent.
+ */
+export async function commandWithDefaultedTab(
+  c: Pick<ControlClient, 'command'>,
+  cmd: ControlCommand & { tabId?: string },
+  defaulted: boolean,
+  log: (msg: string) => void = (m) => console.error(m)
+): Promise<{ res: { ok: boolean; result?: unknown }; tabId?: string }> {
+  try {
+    return { res: await c.command(cmd), tabId: cmd.tabId };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!defaulted || cmd.tabId === undefined || !/-> 4\d\d/.test(msg) || !/tab/i.test(msg)) throw e;
+    log(`hyperpanes-mcp: ${cmd.type} rejected the caller's tab (${msg}); retrying in the window's active tab`);
+    const { tabId: _drop, ...rest } = cmd;
+    return { res: await c.command(rest as ControlCommand) };
+  }
 }
 
 /** The `projectTab` field of a newPane spec: only sent when set, and never without `project`. */
