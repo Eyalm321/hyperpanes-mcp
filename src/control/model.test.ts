@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   flattenPanes,
+  tabStatusOf,
   resolveWindowIdForTab,
   firstWindowId,
   firstWindowActiveTabId,
@@ -156,7 +157,8 @@ describe('resolveWhoami', () => {
       meta: { role: 'manager:frontend', parent: 'ceo', agentType: 'claude', task: 'ship' },
       windowId: 1,
       tabId: 't',
-      tabTitle: 'team'
+      tabTitle: 'team',
+      tabStatus: 'working'
     });
   });
 
@@ -195,5 +197,32 @@ describe('subtreePaneIds (org tree via meta.parent)', () => {
     expect(subtreePaneIds(tree, 'mgr').sort()).toEqual(['w1', 'w2']);
     expect(subtreePaneIds(tree, 'w1')).toEqual([]); // leaf
     expect(subtreePaneIds(tree, 'lone')).toEqual([]); // no children
+  });
+});
+
+describe('tab status', () => {
+  const mk = (activity: 'busy' | 'idle' | 'exited', i = 0) => ({
+    id: `p${i}`,
+    sessionUid: `s${i}`,
+    label: 'x',
+    color: '#fff',
+    status: activity === 'exited' ? ('exited' as const) : ('running' as const),
+    activity
+  });
+  it('passes the app-sent status through', () => {
+    expect(tabStatusOf({ id: 't', title: 't', layout: 'auto', status: 'working', panes: [mk('idle')] })).toBe('working');
+    expect(tabStatusOf({ id: 't', title: 't', layout: 'auto', status: 'idle', panes: [mk('busy')] })).toBe('idle');
+  });
+  it('derives working when any pane is busy', () => {
+    expect(tabStatusOf({ id: 't', title: 't', layout: 'auto', panes: [mk('busy', 1), mk('idle', 2), mk('exited', 3)] })).toBe('working');
+  });
+  it('derives idle for idle + exited panes and for an empty tab', () => {
+    expect(tabStatusOf({ id: 't', title: 't', layout: 'auto', panes: [mk('idle', 1), mk('exited', 2)] })).toBe('idle');
+    expect(tabStatusOf({ id: 't', title: 't', layout: 'auto', panes: [] })).toBe('idle');
+  });
+  it('flattenPanes carries tabStatus', () => {
+    const flat = flattenPanes(state);
+    expect(flat[0]?.tabStatus).toBe('working'); // tab-a has a busy pane
+    expect(flat[2]?.tabStatus).toBe('idle'); // tab-b only idle
   });
 });
