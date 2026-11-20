@@ -1114,8 +1114,11 @@ function registerSpawnWorkers(server: McpServer): void {
         await c.sendInput(paneId, text, owner, true);
         // Confirm the submit landed BEFORE waiting for the reply, so the returned
         // screen is past Claude's UserPromptSubmit hook window (the text stays in
-        // the box while hooks run). Grace scales with a large timeoutMs.
-        const graceMs = Math.min(30_000, Math.max(6_000, Math.floor((timeoutMs ?? 30_000) / 5)));
+        // the box while hooks run). Grace scales with a large timeoutMs. Its 10 s floor
+        // stays clear of the app's own verified submit (one insurance Enter at ~5 s,
+        // whose transcript record lands ~1-2 s later under load), so the two never
+        // both fire for one dropped Enter.
+        const graceMs = Math.min(30_000, Math.max(10_000, Math.floor((timeoutMs ?? 30_000) / 5)));
         const { submitted, retried } = await confirmSubmit(
           {
             readTranscript: snap,
