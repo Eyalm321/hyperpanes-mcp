@@ -50,47 +50,6 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/**
- * Heuristic: did a `prompt_pane` submit fail to register? A freshly-launched TUI
- * can drop the trailing bare CR that submits a line — its input loop isn't armed
- * yet, so the text lands in the input box but is never sent (cold-start race; see
- * the app's control-input.ts "live finding, 2026-06-05"). The turn-aware wait is
- * no help on its own: the paste ECHO advances output past the cursor, so the read
- * still reports `settled:true` exactly as a real turn would. The tell is the
- * CONTENT — only our own keystrokes came back, with no reply after them.
- *
- * We compare the raw output delta (everything the pane emitted since just before
- * the send) against the text we typed, both reduced to alphanumerics. After
- * removing the echo, a genuine reply leaves a substantial residual; a dropped
- * submit leaves only input-box / status-line redraw noise.
- *
- * Tuned to err toward retrying: a false positive costs one extra bare Enter,
- * which is a no-op in an already-empty input box, whereas a false negative leaves
- * the prompt stuck unsent. A `timedOut` turn means the agent is still working
- * (output never went quiet) — NOT a dropped submit — so those never qualify.
- */
-export function submitLikelyDropped(
-  rawDelta: string,
-  text: string,
-  settled: boolean,
-  timedOut: boolean
-): boolean {
-  if (!settled || timedOut) return false;
-  const norm = (s: string): string => s.replace(/[^a-z0-9]/gi, '').toLowerCase();
-  const deltaNorm = norm(rawDelta);
-  const textNorm = norm(text);
-  const echoIdx = textNorm.length > 0 ? deltaNorm.indexOf(textNorm) : -1;
-  // Strip one occurrence of the echoed text; what's left should be a real reply
-  // (large) or just redraw chrome (small). When the echo wrapped oddly and isn't
-  // a clean substring, fall back to a length subtraction.
-  const residualLen =
-    echoIdx >= 0 ? deltaNorm.length - textNorm.length : Math.max(0, deltaNorm.length - textNorm.length);
-  // Below this many alphanumerics beyond the echo, nothing but input-box / status
-  // redraw came back — no reply. A genuine reply dwarfs it.
-  const ECHO_NOISE_CEILING = 64;
-  return residualLen <= ECHO_NOISE_CEILING;
-}
-
 const normAlnum = (s: string): string => s.replace(/[^a-z0-9]/gi, '').toLowerCase();
 const SUBMIT_PREFIX_CHARS = 20;
 
@@ -106,6 +65,8 @@ export interface TranscriptSnapshot {
   messages: { role: string; text: string }[];
 }
 
+export type PromptInputLine = { text: string; kind: string };
+
 export interface SubmitConfirmInput {
   /** The text prompt_pane typed. */
   text: string;
@@ -113,8 +74,19 @@ export interface SubmitConfirmInput {
   pre: TranscriptSnapshot | null;
   /** Current transcript read; null = unsupported / read failed. */
   transcript: TranscriptSnapshot | null;
-  /** Current screen inputLine; null/undefined = no prompt box detected. */
-  inputLine: { text: string; kind: string } | null | undefined;
+  /**
+   * Current screen inputLine. null = the screen read worked and shows no prompt box;
+   * undefined = the screen read FAILED (pane gone, app restarting). The two are kept
+   * apart: a failed read is never evidence that the submit landed.
+   */
+  inputLine: PromptInputLine | null | undefined;
+  /**
+   * The box has been seen holding our text at least once since the send. Until then
+   * an empty box or a ghost suggestion may simply be the screen from BEFORE the
+   * typed text echoed (the app writes the text, then the Enter ~250 ms later), so
+   * it proves nothing.
+   */
+  sawOurText: boolean;
   /** Ms since the send (or since the corrective Enter, once retried). */
   elapsedMs: number;
   graceMs: number;
@@ -122,46 +94,92 @@ export interface SubmitConfirmInput {
   retried: boolean;
 }
 
-export type SubmitDecision = 'submitted' | 'wait' | 'retry' | 'give-up';
+/**
+ * - `submitted`: proven (a new transcript user record with our text, or the box
+ *   cleared after it was seen holding our text).
+ * - `wait`: poll again.
+ * - `retry`: the box still holds our text past the grace; send ONE corrective Enter.
+ * - `give-up`: not confirmed; report `submitted:false` (fail closed).
+ * - `unverified`: nothing to check against (no prompt box and no transcript, e.g. a
+ *   shell pane); report `submitted:"unverified"` at once, no retry.
+ */
+export type SubmitDecision = 'submitted' | 'wait' | 'retry' | 'give-up' | 'unverified';
+
+/** Window for the prompt box to appear on a pane with no transcript before giving up on verifying. */
+export const NO_BOX_VERIFY_MS = 500;
+
+/** True when the box holds the text we typed (a ghost suggestion never counts). */
+export function boxHoldsOurText(text: string, line: PromptInputLine | null | undefined): boolean {
+  if (!line || line.kind === 'empty' || line.kind === 'suggestion') return false;
+  const prefix = submitPrefix(text);
+  return prefix !== '' && normAlnum(line.text).startsWith(prefix);
+}
 
 /**
  * Pure decision: did the submit Enter land? A submitted Claude prompt stays in the
  * input box while its UserPromptSubmit hooks run, so the box alone cannot prove a
- * drop; the transcript's new user record is the authoritative proof of submission.
- * Retry (a blind second Enter could double-submit) only when the box still holds
- * our text AND the transcript shows nothing new, after the grace window.
+ * drop; the transcript's new user record (written once the hooks pass) is the
+ * authoritative proof. Retry (a blind second Enter could double-submit) only when
+ * the box still holds our text AND the transcript shows nothing new, after the
+ * grace window. Anything short of proof fails closed.
  */
 export function decideSubmit(i: SubmitConfirmInput): SubmitDecision {
   const prefix = submitPrefix(i.text);
-  if (i.transcript) {
-    const preTotal = i.pre?.total ?? 0;
-    if (
-      i.transcript.total > preTotal &&
-      i.transcript.messages.some((m) => m.role === 'user' && prefix !== '' && normAlnum(m.text).includes(prefix))
-    ) {
-      return 'submitted';
-    }
+  if (i.transcript && prefix !== '') {
+    const added = i.transcript.total - (i.pre?.total ?? 0);
+    // Only the records added since the send count: an earlier identical prompt
+    // still in the tail must not confirm this one.
+    const fresh = added > 0 ? i.transcript.messages.slice(-added) : [];
+    if (fresh.some((m) => m.role === 'user' && normAlnum(m.text).includes(prefix))) return 'submitted';
   }
+  const inGrace = i.elapsedMs < i.graceMs;
   const line = i.inputLine;
-  if (line) {
-    if (line.kind === 'empty' || line.kind === 'suggestion') return 'submitted';
-    const boxNorm = normAlnum(line.text);
-    if (prefix === '' ? boxNorm === '' : !boxNorm.startsWith(prefix)) return 'submitted';
+  if (line === undefined) {
+    // The screen read failed: wait for a good read, never count it as proof.
+    return inGrace ? 'wait' : 'give-up';
+  }
+  if (line === null) {
+    // Good read, no prompt box. Without a transcript there is nothing that could
+    // ever confirm the submit: say so at once (after a short window for a box that
+    // is still drawing), with no retry.
+    if (!i.pre && !i.transcript && !i.sawOurText) {
+      return i.elapsedMs < Math.min(NO_BOX_VERIFY_MS, i.graceMs) ? 'wait' : 'unverified';
+    }
+    // A transcript to watch but no box: wait for the record; no box means no
+    // safe retry, so an unconfirmed timeout fails closed.
+    return inGrace ? 'wait' : 'give-up';
+  }
+  if (boxHoldsOurText(i.text, line)) {
     // Box still holds our text and the transcript hasn't advanced.
-    if (i.elapsedMs < i.graceMs) return 'wait';
+    if (inGrace) return 'wait';
     return i.retried ? 'give-up' : 'retry';
   }
-  // No prompt box to inspect: unknown TUI. Wait out the grace for the transcript, then assume it landed.
-  return i.elapsedMs < i.graceMs ? 'wait' : 'submitted';
+  // Empty box, ghost suggestion, or other text: proof only once our text was seen.
+  if (i.sawOurText) return 'submitted';
+  if (inGrace) return 'wait';
+  // Our text never showed. With a transcript, its missing record says the submit
+  // did not land; without one we cannot tell.
+  return i.pre || i.transcript ? 'give-up' : 'unverified';
 }
 
 export interface SubmitConfirmDeps {
   readTranscript: () => Promise<TranscriptSnapshot | null>;
-  readInputLine: () => Promise<{ text: string; kind: string } | null | undefined>;
+  readInputLine: () => Promise<PromptInputLine | null | undefined>;
   sendEnter: () => Promise<void>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
 }
+
+export interface SubmitConfirmResult {
+  /** true = proven; false = not confirmed (fail closed); "unverified" = nothing to check against. */
+  submitted: boolean | 'unverified';
+  retried: boolean;
+  /** The last screen-read error, when reads failed. */
+  error?: string;
+}
+
+/** Consecutive failed screen reads that end the confirm early (pane closed, app down). */
+const MAX_READ_ERRORS = 3;
 
 /** Poll until the submit is confirmed; fire at most one corrective Enter. */
 export async function confirmSubmit(
@@ -170,17 +188,46 @@ export async function confirmSubmit(
   pre: TranscriptSnapshot | null,
   graceMs: number,
   pollMs = 250
-): Promise<{ submitted: boolean; retried: boolean }> {
+): Promise<SubmitConfirmResult> {
+  // An empty prompt leaves nothing in the box or the transcript to recognise.
+  if (submitPrefix(text) === '') return { submitted: 'unverified', retried: false };
   let retried = false;
+  let sawOurText = false;
+  let readErrors = 0;
+  let lastError: string | undefined;
   let t0 = deps.now();
   for (;;) {
     const [transcript, inputLine] = await Promise.all([
       deps.readTranscript().catch(() => null),
-      deps.readInputLine().catch(() => undefined)
+      deps.readInputLine().then(
+        (l) => {
+          readErrors = 0;
+          // A missing field (older app) is "no box", not a failed read.
+          return l ?? null;
+        },
+        (err: unknown) => {
+          readErrors++;
+          lastError = errMessage(err);
+          return undefined;
+        }
+      )
     ]);
-    const d = decideSubmit({ text, pre, transcript, inputLine, elapsedMs: deps.now() - t0, graceMs, retried });
+    if (boxHoldsOurText(text, inputLine)) sawOurText = true;
+    const errOut = lastError ? { error: lastError } : {};
+    if (readErrors >= MAX_READ_ERRORS) return { submitted: false, retried, ...errOut };
+    const d = decideSubmit({
+      text,
+      pre,
+      transcript,
+      inputLine,
+      sawOurText,
+      elapsedMs: deps.now() - t0,
+      graceMs,
+      retried
+    });
     if (d === 'submitted') return { submitted: true, retried };
-    if (d === 'give-up') return { submitted: false, retried };
+    if (d === 'unverified') return { submitted: 'unverified', retried };
+    if (d === 'give-up') return { submitted: false, retried, ...errOut };
     if (d === 'retry') {
       await deps.sendEnter();
       retried = true;
@@ -1073,7 +1120,7 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Prompt a pane and read the reply',
       description:
-        'Drive one full turn of a TUI agent (e.g. a live `claude`) in a pane with ONE call: type `text`, submit it cleanly (a separate Enter), wait for the pane to go output-quiet, then confirm the submit landed (transcript shows the new user message, or the input box no longer holds the text; ONE corrective bare Enter only if the text is still in the box and the transcript shows nothing new), then return the RENDERED screen transcript and whether it is now awaiting input. The call returns only after the submit is confirmed: `submitted:false` means it is still unconfirmed after the retry and the text may still be sitting in the box; `retried:true` means the corrective Enter fired. The wait is turn-aware — it won\'t return on the pre-prompt screen, only once the reply has begun and settled. Composes send_input(submit) + read_pane(waitForIdle, mode:"screen"). Same triple gate as send_input (it IS input): app toggle + HYPERPANES_ALLOW_INPUT=1 + confirm=true.',
+        'Drive one full turn of a TUI agent (e.g. a live `claude`) in a pane with ONE call: type `text`, submit it cleanly (a separate Enter), wait for the pane to go output-quiet, then confirm the submit landed (the transcript shows the new user message, or the input box was seen holding the text and then cleared; ONE corrective bare Enter only if the text is still in the box and the transcript shows nothing new), then return the RENDERED screen transcript and whether it is now awaiting input. `submitted` is one of: `true` = confirmed; `false` = not confirmed (the text may still be sitting in the box, or a screen read failed: then `error` says why); `"unverified"` = the pane has no Claude-style prompt box and no transcript (e.g. a shell), so nothing could confirm it; the call returns at once without a retry. `retried:true` means the corrective Enter fired. The confirm step runs before the reply wait and is not bounded by `timeoutMs`: it can take up to 2 x clamp(timeoutMs/5, 10 s, 30 s), so up to 60 s, before the reply wait starts. The wait is turn-aware — it won\'t return on the pre-prompt screen, only once the reply has begun and settled. Composes send_input(submit) + read_pane(waitForIdle, mode:"screen"). Same triple gate as send_input (it IS input): app toggle + HYPERPANES_ALLOW_INPUT=1 + confirm=true.',
       inputSchema: {
         paneId: z.string(),
         text: z.string().describe('The message to type. No trailing newline needed — it is submitted for you.'),
@@ -1116,10 +1163,10 @@ function registerSpawnWorkers(server: McpServer): void {
         // screen is past Claude's UserPromptSubmit hook window (the text stays in
         // the box while hooks run). Grace scales with a large timeoutMs. Its 10 s floor
         // stays clear of the app's own verified submit (one insurance Enter at ~5 s,
-        // whose transcript record lands ~1-2 s later under load), so the two never
-        // both fire for one dropped Enter.
+        // whose transcript record lands only after the prompt's hooks finish), so the
+        // two never both fire for one dropped Enter.
         const graceMs = Math.min(30_000, Math.max(10_000, Math.floor((timeoutMs ?? 30_000) / 5)));
-        const { submitted, retried } = await confirmSubmit(
+        const { submitted, retried, error } = await confirmSubmit(
           {
             readTranscript: snap,
             readInputLine: async () => (await c.readPane(paneId, { mode: 'screen' })).inputLine,
@@ -1140,7 +1187,8 @@ function registerSpawnWorkers(server: McpServer): void {
           awaitingInput: reply.awaitingInput ?? false,
           cursor: reply.cursor,
           submitted,
-          ...(retried ? { retried: true, recovered: true } : {}),
+          ...(retried ? { retried: true, recovered: submitted === true } : {}),
+          ...(error ? { error } : {}),
           reply: reply.output
         };
       })

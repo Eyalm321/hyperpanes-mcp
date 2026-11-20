@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import {
-  submitLikelyDropped,
   decideSubmit,
   confirmSubmit,
   type SubmitConfirmInput,
@@ -22,45 +21,6 @@ import {
 } from './control-tools.js';
 import { GroupSpecSchema } from './schema.js';
 import type { ControlState, ControlPane } from './control/model.js';
-
-// Cold-start submit-drop detector (prompt_pane self-heal). The signature of a
-// dropped submit is: the turn settled, but the only thing that came back was our
-// own keystrokes echoed into the input box — no reply followed.
-describe('submitLikelyDropped', () => {
-  const TEXT = 'hey there, what are you working on?';
-
-  it('flags a dropped submit: delta is just the echo + a little status chrome', () => {
-    // What the pane emits when the CR is swallowed: the text redrawn in the input
-    // box, plus the status line repainting. No assistant reply.
-    const delta = `❯ ${TEXT}\n  [Sonnet 4.6 high] Admin | ctx 0%  ⏵⏵ auto mode on`;
-    expect(submitLikelyDropped(delta, TEXT, true, false)).toBe(true);
-  });
-
-  it('does NOT flag a real turn: the reply dwarfs the echo', () => {
-    const reply =
-      'I am refactoring the auth middleware to pull the token verification into a ' +
-      'shared helper so the three route handlers stop duplicating it. About halfway.';
-    const delta = `❯ ${TEXT}\n● ${reply}`;
-    expect(submitLikelyDropped(delta, TEXT, true, false)).toBe(false);
-  });
-
-  it('never flags a still-working agent (timedOut ⇒ output never went quiet)', () => {
-    const delta = `❯ ${TEXT}\n● `; // reply has begun but not settled
-    expect(submitLikelyDropped(delta, TEXT, false, true)).toBe(false);
-  });
-
-  it('never flags an unsettled read', () => {
-    const delta = `❯ ${TEXT}`;
-    expect(submitLikelyDropped(delta, TEXT, false, false)).toBe(false);
-  });
-
-  it('is robust to the echo wrapping / box-drawing noise inside the typed text', () => {
-    // The TUI can interleave border glyphs and newlines as it wraps a long line;
-    // normalizing to alphanumerics still recognizes the echo as our own text.
-    const wrapped = '❯ hey there, what are\n  │ working on?'; // mangled echo, no reply
-    expect(submitLikelyDropped(wrapped, TEXT, true, false)).toBe(true);
-  });
-});
 
 describe('running app version', () => {
   const pane = { id: 'p1', label: 'one', status: 'running' } as unknown as ControlPane;
@@ -457,11 +417,14 @@ const afterSnap: TranscriptSnapshot = {
   total: 5,
   messages: [{ role: 'user', text: 'earlier' }, { role: 'user', text: PROMPT }]
 };
+const typed = { text: PROMPT, kind: 'typed' };
+const empty = { text: '', kind: 'empty' };
 const base: SubmitConfirmInput = {
   text: PROMPT,
   pre: preSnap,
   transcript: preSnap,
-  inputLine: { text: PROMPT, kind: 'typed' },
+  inputLine: typed,
+  sawOurText: true,
   elapsedMs: 0,
   graceMs: 6000,
   retried: false
@@ -471,8 +434,13 @@ describe('decideSubmit', () => {
   it('transcript advanced while box still shows the text (hook window) -> submitted, no retry', () => {
     expect(decideSubmit({ ...base, transcript: afterSnap, elapsedMs: 9000 })).toBe('submitted');
   });
-  it('box emptied -> submitted', () => {
-    expect(decideSubmit({ ...base, inputLine: { text: '', kind: 'empty' } })).toBe('submitted');
+  it('box emptied after it held our text -> submitted', () => {
+    expect(decideSubmit({ ...base, inputLine: empty })).toBe('submitted');
+  });
+  it('empty box before our text was ever seen is the pre-echo screen -> wait, then give-up', () => {
+    const b = { ...base, inputLine: empty, sawOurText: false };
+    expect(decideSubmit({ ...b, elapsedMs: 0 })).toBe('wait');
+    expect(decideSubmit({ ...b, elapsedMs: 6000 })).toBe('give-up');
   });
   it('box holds text, no transcript advance, within grace -> wait', () => {
     expect(decideSubmit({ ...base, elapsedMs: 1000 })).toBe('wait');
@@ -483,38 +451,68 @@ describe('decideSubmit', () => {
   it('still stuck after the retry -> give-up', () => {
     expect(decideSubmit({ ...base, elapsedMs: 6000, retried: true })).toBe('give-up');
   });
-  it('box holds different text (someone else typing) -> no retry', () => {
+  it('box holds different text after ours was seen (someone else typing) -> no retry', () => {
     expect(
       decideSubmit({ ...base, elapsedMs: 9000, inputLine: { text: 'something else entirely', kind: 'typed' } })
     ).toBe('submitted');
   });
   it('ghost suggestion in the box is not our text', () => {
-    expect(decideSubmit({ ...base, elapsedMs: 9000, inputLine: { text: PROMPT, kind: 'suggestion' } })).toBe(
-      'submitted'
-    );
+    expect(
+      decideSubmit({ ...base, sawOurText: false, elapsedMs: 9000, inputLine: { text: PROMPT, kind: 'suggestion' } })
+    ).toBe('give-up');
   });
-  it('no inputLine and no transcript: wait, then treat as submitted after grace', () => {
-    const b = { ...base, inputLine: null, transcript: null, pre: null };
-    expect(decideSubmit({ ...b, elapsedMs: 1000 })).toBe('wait');
-    expect(decideSubmit({ ...b, elapsedMs: 6000 })).toBe('submitted');
+  it('no inputLine and no transcript: unverified after a short window, never submitted', () => {
+    const b = { ...base, inputLine: null, transcript: null, pre: null, sawOurText: false };
+    expect(decideSubmit({ ...b, elapsedMs: 0 })).toBe('wait');
+    expect(decideSubmit({ ...b, elapsedMs: 500 })).toBe('unverified');
+  });
+  it('failed screen read (undefined) is never proof: wait, then give-up', () => {
+    const b = { ...base, inputLine: undefined, transcript: null, pre: null, sawOurText: false };
+    expect(decideSubmit({ ...b, elapsedMs: 0 })).toBe('wait');
+    expect(decideSubmit({ ...b, elapsedMs: 6000 })).toBe('give-up');
   });
   it('transcript with an unrelated new user message does not count as proof', () => {
     const other: TranscriptSnapshot = { total: 5, messages: [{ role: 'user', text: 'unrelated message' }] };
     expect(decideSubmit({ ...base, transcript: other, elapsedMs: 6000 })).toBe('retry');
   });
+  it('an earlier identical prompt in the tail does not confirm a new one', () => {
+    const pre2: TranscriptSnapshot = {
+      total: 4,
+      messages: [{ role: 'user', text: PROMPT }, { role: 'assistant', text: 'x' }]
+    };
+    const grown: TranscriptSnapshot = {
+      total: 5,
+      messages: [{ role: 'user', text: PROMPT }, { role: 'assistant', text: 'x' }, { role: 'assistant', text: 'y' }]
+    };
+    expect(decideSubmit({ ...base, pre: pre2, transcript: grown, elapsedMs: 300 })).toBe('wait');
+  });
 });
 
-describe('confirmSubmit (incident sequence)', () => {
-  function harness(script: (t: number, enters: number) => { tr: TranscriptSnapshot | null; line: SubmitConfirmInput['inputLine'] }) {
+describe('confirmSubmit', () => {
+  function harness(
+    script: (t: number, enters: number) => { tr: TranscriptSnapshot | null; line: SubmitConfirmInput['inputLine'] },
+    throwLine = false
+  ) {
     let t = 0;
     let enters = 0;
+    let reads = 0;
     return {
       get enters() {
         return enters;
       },
+      get t() {
+        return t;
+      },
+      get reads() {
+        return reads;
+      },
       deps: {
         readTranscript: async () => script(t, enters).tr,
-        readInputLine: async () => script(t, enters).line,
+        readInputLine: async () => {
+          reads++;
+          if (throwLine) throw new Error('pane gone');
+          return script(t, enters).line;
+        },
         sendEnter: async () => {
           enters++;
         },
@@ -529,7 +527,7 @@ describe('confirmSubmit (incident sequence)', () => {
   it('hooks hold the text in the box for ~2s after the transcript advanced: no extra Enter', async () => {
     const h = harness((t) => ({
       tr: t >= 1300 ? afterSnap : preSnap,
-      line: t < 3300 ? { text: PROMPT, kind: 'typed' } : { text: '', kind: 'empty' }
+      line: t < 3300 ? typed : empty
     }));
     const r = await confirmSubmit(h.deps, PROMPT, preSnap, 6000);
     expect(r).toEqual({ submitted: true, retried: false });
@@ -539,7 +537,7 @@ describe('confirmSubmit (incident sequence)', () => {
   it('dropped Enter: one corrective Enter, then confirmed', async () => {
     const h = harness((_t, enters) => ({
       tr: enters > 0 ? afterSnap : preSnap,
-      line: enters > 0 ? { text: '', kind: 'empty' } : { text: PROMPT, kind: 'typed' }
+      line: enters > 0 ? empty : typed
     }));
     const r = await confirmSubmit(h.deps, PROMPT, preSnap, 6000);
     expect(r).toEqual({ submitted: true, retried: true });
@@ -547,9 +545,87 @@ describe('confirmSubmit (incident sequence)', () => {
   });
 
   it('never more than one retry; reports submitted:false', async () => {
-    const h = harness(() => ({ tr: preSnap, line: { text: PROMPT, kind: 'typed' } }));
+    const h = harness(() => ({ tr: preSnap, line: typed }));
     const r = await confirmSubmit(h.deps, PROMPT, preSnap, 6000);
     expect(r).toEqual({ submitted: false, retried: true });
     expect(h.enters).toBe(1);
+  });
+
+  // The first read can run before the typed text echoes: an empty box (or the old
+  // ghost suggestion) there must not read as submitted.
+  it('pre-echo empty box, then the Enter is dropped: retries instead of claiming submitted', async () => {
+    const h = harness((t, enters) => ({
+      tr: enters > 0 ? afterSnap : preSnap,
+      line: t < 100 ? empty : enters > 0 ? empty : typed
+    }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 10000);
+    expect(r).toEqual({ submitted: true, retried: true });
+    expect(h.enters).toBe(1);
+  });
+
+  it('pre-echo empty box, Enter dropped and never recovers: submitted:false', async () => {
+    const h = harness((t) => ({ tr: preSnap, line: t < 100 ? empty : typed }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 10000);
+    expect(r).toEqual({ submitted: false, retried: true });
+    expect(h.enters).toBe(1);
+  });
+
+  it('pre-echo ghost suggestion, then the Enter is dropped: not submitted:true at t=0', async () => {
+    const h = harness((t) => ({
+      tr: preSnap,
+      line: t < 100 ? { text: 'run the tests', kind: 'suggestion' } : typed
+    }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 10000);
+    expect(r).toEqual({ submitted: false, retried: true });
+    expect(h.enters).toBe(1);
+  });
+
+  it('cold start without a transcript: text sits in the box, one Enter heals it', async () => {
+    const h = harness((_t, enters) => ({ tr: null, line: enters > 0 ? empty : typed }));
+    const r = await confirmSubmit(h.deps, PROMPT, null, 10000);
+    expect(r).toEqual({ submitted: true, retried: true });
+    expect(h.enters).toBe(1);
+  });
+
+  it('shell pane (no box, no transcript): unverified at once, no wait for the grace, no Enter', async () => {
+    const h = harness(() => ({ tr: null, line: null }));
+    const r = await confirmSubmit(h.deps, PROMPT, null, 10000);
+    expect(r).toEqual({ submitted: 'unverified', retried: false });
+    expect(h.t).toBeLessThanOrEqual(500);
+    expect(h.enters).toBe(0);
+  });
+
+  it('screen reads fail: fails closed with the error, early, no Enter', async () => {
+    const h = harness(() => ({ tr: null, line: null }), true);
+    const r = await confirmSubmit(h.deps, PROMPT, null, 10000);
+    expect(r).toEqual({ submitted: false, retried: false, error: 'pane gone' });
+    expect(h.t).toBeLessThan(10000);
+    expect(h.enters).toBe(0);
+  });
+
+  it('transcript readable, no box, record never lands: submitted:false, no blind Enter', async () => {
+    const h = harness(() => ({ tr: preSnap, line: null }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 10000);
+    expect(r).toEqual({ submitted: false, retried: false });
+    expect(h.enters).toBe(0);
+  });
+
+  it('transcript readable, no box, record lands: submitted', async () => {
+    const h = harness((t) => ({ tr: t >= 2000 ? afterSnap : preSnap, line: null }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 10000);
+    expect(r).toEqual({ submitted: true, retried: false });
+  });
+
+  it('fast submit cleared the box before any read saw it: the transcript record confirms it', async () => {
+    const h = harness((t) => ({ tr: t >= 750 ? afterSnap : preSnap, line: empty }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 10000);
+    expect(r).toEqual({ submitted: true, retried: false });
+  });
+
+  it('empty prompt: nothing to recognise, unverified without polling', async () => {
+    const h = harness(() => ({ tr: preSnap, line: empty }));
+    const r = await confirmSubmit(h.deps, '', preSnap, 10000);
+    expect(r).toEqual({ submitted: 'unverified', retried: false });
+    expect(h.reads).toBe(0);
   });
 });
