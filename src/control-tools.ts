@@ -91,6 +91,106 @@ export function submitLikelyDropped(
   return residualLen <= ECHO_NOISE_CEILING;
 }
 
+const normAlnum = (s: string): string => s.replace(/[^a-z0-9]/gi, '').toLowerCase();
+const SUBMIT_PREFIX_CHARS = 20;
+
+/** Normalized leading chars of the typed text, used to recognise it in the box / transcript. */
+function submitPrefix(text: string): string {
+  return normAlnum(text).slice(0, SUBMIT_PREFIX_CHARS);
+}
+
+export interface TranscriptSnapshot {
+  /** Total conversation messages in the transcript. */
+  total: number;
+  /** Trailing messages, oldest first. */
+  messages: { role: string; text: string }[];
+}
+
+export interface SubmitConfirmInput {
+  /** The text prompt_pane typed. */
+  text: string;
+  /** Transcript snapshot taken BEFORE the send; null = unsupported / not a Claude pane. */
+  pre: TranscriptSnapshot | null;
+  /** Current transcript read; null = unsupported / read failed. */
+  transcript: TranscriptSnapshot | null;
+  /** Current screen inputLine; null/undefined = no prompt box detected. */
+  inputLine: { text: string; kind: string } | null | undefined;
+  /** Ms since the send (or since the corrective Enter, once retried). */
+  elapsedMs: number;
+  graceMs: number;
+  /** The one corrective Enter was already sent. */
+  retried: boolean;
+}
+
+export type SubmitDecision = 'submitted' | 'wait' | 'retry' | 'give-up';
+
+/**
+ * Pure decision: did the submit Enter land? A submitted Claude prompt stays in the
+ * input box while its UserPromptSubmit hooks run, so the box alone cannot prove a
+ * drop; the transcript's new user record is the authoritative proof of submission.
+ * Retry (a blind second Enter could double-submit) only when the box still holds
+ * our text AND the transcript shows nothing new, after the grace window.
+ */
+export function decideSubmit(i: SubmitConfirmInput): SubmitDecision {
+  const prefix = submitPrefix(i.text);
+  if (i.transcript) {
+    const preTotal = i.pre?.total ?? 0;
+    if (
+      i.transcript.total > preTotal &&
+      i.transcript.messages.some((m) => m.role === 'user' && prefix !== '' && normAlnum(m.text).includes(prefix))
+    ) {
+      return 'submitted';
+    }
+  }
+  const line = i.inputLine;
+  if (line) {
+    if (line.kind === 'empty' || line.kind === 'suggestion') return 'submitted';
+    const boxNorm = normAlnum(line.text);
+    if (prefix === '' ? boxNorm === '' : !boxNorm.startsWith(prefix)) return 'submitted';
+    // Box still holds our text and the transcript hasn't advanced.
+    if (i.elapsedMs < i.graceMs) return 'wait';
+    return i.retried ? 'give-up' : 'retry';
+  }
+  // No prompt box to inspect: unknown TUI. Wait out the grace for the transcript, then assume it landed.
+  return i.elapsedMs < i.graceMs ? 'wait' : 'submitted';
+}
+
+export interface SubmitConfirmDeps {
+  readTranscript: () => Promise<TranscriptSnapshot | null>;
+  readInputLine: () => Promise<{ text: string; kind: string } | null | undefined>;
+  sendEnter: () => Promise<void>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+}
+
+/** Poll until the submit is confirmed; fire at most one corrective Enter. */
+export async function confirmSubmit(
+  deps: SubmitConfirmDeps,
+  text: string,
+  pre: TranscriptSnapshot | null,
+  graceMs: number,
+  pollMs = 250
+): Promise<{ submitted: boolean; retried: boolean }> {
+  let retried = false;
+  let t0 = deps.now();
+  for (;;) {
+    const [transcript, inputLine] = await Promise.all([
+      deps.readTranscript().catch(() => null),
+      deps.readInputLine().catch(() => undefined)
+    ]);
+    const d = decideSubmit({ text, pre, transcript, inputLine, elapsedMs: deps.now() - t0, graceMs, retried });
+    if (d === 'submitted') return { submitted: true, retried };
+    if (d === 'give-up') return { submitted: false, retried };
+    if (d === 'retry') {
+      await deps.sendEnter();
+      retried = true;
+      t0 = deps.now();
+      continue;
+    }
+    await deps.sleep(pollMs);
+  }
+}
+
 /**
  * Register Phase 2 (M4) live-control tools and the subscribable pane-output
  * resource on an McpServer. The server must declare the
@@ -973,7 +1073,7 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Prompt a pane and read the reply',
       description:
-        'Drive one full turn of a TUI agent (e.g. a live `claude`) in a pane with ONE call: type `text`, submit it cleanly (a separate Enter), wait for the pane to go output-quiet, then return the RENDERED screen transcript and whether it is now awaiting input. The wait is turn-aware — it won\'t return on the pre-prompt screen, only once the reply has begun and settled. Composes send_input(submit) + read_pane(waitForIdle, mode:"screen"). Same triple gate as send_input (it IS input): app toggle + HYPERPANES_ALLOW_INPUT=1 + confirm=true.',
+        'Drive one full turn of a TUI agent (e.g. a live `claude`) in a pane with ONE call: type `text`, submit it cleanly (a separate Enter), wait for the pane to go output-quiet, then confirm the submit landed (transcript shows the new user message, or the input box no longer holds the text; ONE corrective bare Enter only if the text is still in the box and the transcript shows nothing new), then return the RENDERED screen transcript and whether it is now awaiting input. The call returns only after the submit is confirmed: `submitted:false` means it is still unconfirmed after the retry and the text may still be sitting in the box; `retried:true` means the corrective Enter fired. The wait is turn-aware — it won\'t return on the pre-prompt screen, only once the reply has begun and settled. Composes send_input(submit) + read_pane(waitForIdle, mode:"screen"). Same triple gate as send_input (it IS input): app toggle + HYPERPANES_ALLOW_INPUT=1 + confirm=true.',
       inputSchema: {
         paneId: z.string(),
         text: z.string().describe('The message to type. No trailing newline needed — it is submitted for you.'),
@@ -1006,24 +1106,29 @@ function registerSpawnWorkers(server: McpServer): void {
         const before = await c.readPane(paneId);
         const readReply = () =>
           c.readPane(paneId, { since: before.cursor, waitForIdle: true, settleMs, timeoutMs, mode: 'screen', tail });
+        const snap = async (): Promise<TranscriptSnapshot | null> => {
+          const t = await readPaneTranscript(paneId, { messages: 6 });
+          return t ? { total: t.totalMessages, messages: t.messages } : null;
+        };
+        const pre = await snap().catch(() => null);
         await c.sendInput(paneId, text, owner, true);
-        let reply = await readReply();
-        // Cold-start self-heal: a just-launched TUI can swallow the first submit's
-        // bare CR, leaving the text typed but unsent (see submitLikelyDropped).
-        // If the turn came back as echo-with-no-reply AND this pane is still early
-        // in its life (small byte cursor ⇒ the only window the drop happens in),
-        // fire one corrective Enter and re-read. The extra CR is a no-op if the
-        // box turned out to be empty, so a misfire is harmless. Capped at one try.
-        const COLD_START_BYTES = 16_000;
-        let recovered = false;
-        if ((before.cursor ?? 0) < COLD_START_BYTES) {
-          const delta = await c.readPane(paneId, { since: before.cursor, strip: true });
-          if (submitLikelyDropped(delta.output ?? '', text, reply.settled ?? false, reply.timedOut ?? false)) {
-            await c.sendInput(paneId, '', owner, true); // bare Enter — submit what's sitting in the box
-            reply = await readReply();
-            recovered = true;
-          }
-        }
+        // Confirm the submit landed BEFORE waiting for the reply, so the returned
+        // screen is past Claude's UserPromptSubmit hook window (the text stays in
+        // the box while hooks run). Grace scales with a large timeoutMs.
+        const graceMs = Math.min(30_000, Math.max(6_000, Math.floor((timeoutMs ?? 30_000) / 5)));
+        const { submitted, retried } = await confirmSubmit(
+          {
+            readTranscript: snap,
+            readInputLine: async () => (await c.readPane(paneId, { mode: 'screen' })).inputLine,
+            sendEnter: () => c.sendInput(paneId, '', owner, true), // bare Enter
+            sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+            now: () => Date.now()
+          },
+          text,
+          pre,
+          graceMs
+        );
+        const reply = await readReply();
         return {
           ok: true,
           paneId,
@@ -1031,7 +1136,8 @@ function registerSpawnWorkers(server: McpServer): void {
           timedOut: reply.timedOut ?? false,
           awaitingInput: reply.awaitingInput ?? false,
           cursor: reply.cursor,
-          ...(recovered ? { recovered: true } : {}),
+          submitted,
+          ...(retried ? { retried: true, recovered: true } : {}),
           reply: reply.output
         };
       })

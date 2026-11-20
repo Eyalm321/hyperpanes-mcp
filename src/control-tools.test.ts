@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   submitLikelyDropped,
+  decideSubmit,
+  confirmSubmit,
+  type SubmitConfirmInput,
+  type TranscriptSnapshot,
   whoamiResult,
   listPanesResult,
   pickBuild,
@@ -442,5 +446,110 @@ describe('a defaulted caller tab never breaks an older app', () => {
       console.error = errSpy;
     }
     expect(sent).toHaveLength(3);
+  });
+});
+
+// prompt_pane submit confirmation: a submitted Claude prompt stays in the box while
+// UserPromptSubmit hooks run, so the transcript (not the box) is the proof.
+const PROMPT = 'please summarise the build failure in detail';
+const preSnap: TranscriptSnapshot = { total: 4, messages: [{ role: 'user', text: 'earlier' }] };
+const afterSnap: TranscriptSnapshot = {
+  total: 5,
+  messages: [{ role: 'user', text: 'earlier' }, { role: 'user', text: PROMPT }]
+};
+const base: SubmitConfirmInput = {
+  text: PROMPT,
+  pre: preSnap,
+  transcript: preSnap,
+  inputLine: { text: PROMPT, kind: 'typed' },
+  elapsedMs: 0,
+  graceMs: 6000,
+  retried: false
+};
+
+describe('decideSubmit', () => {
+  it('transcript advanced while box still shows the text (hook window) -> submitted, no retry', () => {
+    expect(decideSubmit({ ...base, transcript: afterSnap, elapsedMs: 9000 })).toBe('submitted');
+  });
+  it('box emptied -> submitted', () => {
+    expect(decideSubmit({ ...base, inputLine: { text: '', kind: 'empty' } })).toBe('submitted');
+  });
+  it('box holds text, no transcript advance, within grace -> wait', () => {
+    expect(decideSubmit({ ...base, elapsedMs: 1000 })).toBe('wait');
+  });
+  it('box holds text, no transcript advance, grace elapsed -> retry', () => {
+    expect(decideSubmit({ ...base, elapsedMs: 6000 })).toBe('retry');
+  });
+  it('still stuck after the retry -> give-up', () => {
+    expect(decideSubmit({ ...base, elapsedMs: 6000, retried: true })).toBe('give-up');
+  });
+  it('box holds different text (someone else typing) -> no retry', () => {
+    expect(
+      decideSubmit({ ...base, elapsedMs: 9000, inputLine: { text: 'something else entirely', kind: 'typed' } })
+    ).toBe('submitted');
+  });
+  it('ghost suggestion in the box is not our text', () => {
+    expect(decideSubmit({ ...base, elapsedMs: 9000, inputLine: { text: PROMPT, kind: 'suggestion' } })).toBe(
+      'submitted'
+    );
+  });
+  it('no inputLine and no transcript: wait, then treat as submitted after grace', () => {
+    const b = { ...base, inputLine: null, transcript: null, pre: null };
+    expect(decideSubmit({ ...b, elapsedMs: 1000 })).toBe('wait');
+    expect(decideSubmit({ ...b, elapsedMs: 6000 })).toBe('submitted');
+  });
+  it('transcript with an unrelated new user message does not count as proof', () => {
+    const other: TranscriptSnapshot = { total: 5, messages: [{ role: 'user', text: 'unrelated message' }] };
+    expect(decideSubmit({ ...base, transcript: other, elapsedMs: 6000 })).toBe('retry');
+  });
+});
+
+describe('confirmSubmit (incident sequence)', () => {
+  function harness(script: (t: number, enters: number) => { tr: TranscriptSnapshot | null; line: SubmitConfirmInput['inputLine'] }) {
+    let t = 0;
+    let enters = 0;
+    return {
+      get enters() {
+        return enters;
+      },
+      deps: {
+        readTranscript: async () => script(t, enters).tr,
+        readInputLine: async () => script(t, enters).line,
+        sendEnter: async () => {
+          enters++;
+        },
+        sleep: async (ms: number) => {
+          t += ms;
+        },
+        now: () => t
+      }
+    };
+  }
+
+  it('hooks hold the text in the box for ~2s after the transcript advanced: no extra Enter', async () => {
+    const h = harness((t) => ({
+      tr: t >= 1300 ? afterSnap : preSnap,
+      line: t < 3300 ? { text: PROMPT, kind: 'typed' } : { text: '', kind: 'empty' }
+    }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 6000);
+    expect(r).toEqual({ submitted: true, retried: false });
+    expect(h.enters).toBe(0);
+  });
+
+  it('dropped Enter: one corrective Enter, then confirmed', async () => {
+    const h = harness((_t, enters) => ({
+      tr: enters > 0 ? afterSnap : preSnap,
+      line: enters > 0 ? { text: '', kind: 'empty' } : { text: PROMPT, kind: 'typed' }
+    }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 6000);
+    expect(r).toEqual({ submitted: true, retried: true });
+    expect(h.enters).toBe(1);
+  });
+
+  it('never more than one retry; reports submitted:false', async () => {
+    const h = harness(() => ({ tr: preSnap, line: { text: PROMPT, kind: 'typed' } }));
+    const r = await confirmSubmit(h.deps, PROMPT, preSnap, 6000);
+    expect(r).toEqual({ submitted: false, retried: true });
+    expect(h.enters).toBe(1);
   });
 });
