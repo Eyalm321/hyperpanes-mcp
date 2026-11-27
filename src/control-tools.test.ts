@@ -8,6 +8,7 @@ import {
   listPanesResult,
   pickBuild,
   renameTabResult,
+  restartPaneResult,
   movePaneResult,
   projectTabField,
   newPaneTarget,
@@ -627,5 +628,45 @@ describe('confirmSubmit', () => {
     const r = await confirmSubmit(h.deps, '', preSnap, 10000);
     expect(r).toEqual({ submitted: 'unverified', retried: false });
     expect(h.reads).toBe(0);
+  });
+});
+
+describe('restart_pane env (account move)', () => {
+  const recorder = () => {
+    const sent: unknown[] = [];
+    const c = {
+      command: async (cmd: unknown) => {
+        sent.push(cmd);
+        return { ok: true };
+      }
+    } as never;
+    return { c, sent };
+  };
+
+  it('passes env through to restartPane, with or without resume', async () => {
+    const env = { CLAUDE_CONFIG_DIR: '/home/u/.claude-b' };
+    const { c, sent } = recorder();
+    const r = await restartPaneResult(c, { paneId: 'p1', resume: true, prompt: 'go on', env });
+    await restartPaneResult(c, { paneId: 'p2', env });
+    expect(sent).toEqual([
+      { type: 'restartPane', paneId: 'p1', resume: true, prompt: 'go on', env },
+      { type: 'restartPane', paneId: 'p2', env }
+    ]);
+    expect(r).toEqual({ ok: true, paneId: 'p1', action: 'restartPane', resume: true });
+  });
+
+  it('sends no env key when none is given, and drops a prompt without resume', async () => {
+    const { c, sent } = recorder();
+    await restartPaneResult(c, { paneId: 'p1', prompt: 'ignored' });
+    expect(sent).toEqual([{ type: 'restartPane', paneId: 'p1' }]);
+  });
+
+  it('surfaces the app refusal of a disallowed env key', async () => {
+    const c = {
+      command: async () => {
+        throw new Error('env HOME refused on restartPane');
+      }
+    } as never;
+    await expect(restartPaneResult(c, { paneId: 'p1', env: { HOME: '/x' } })).rejects.toThrow('refused on restartPane');
   });
 });

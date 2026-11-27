@@ -887,23 +887,18 @@ function registerSpawnWorkers(server: McpServer): void {
     {
       title: 'Restart pane',
       description:
-        'Kill and respawn a pane\'s shell. With resume:true, the pane\'s live Claude conversation (per its session marker) is resumed in its own cwd after the respawn — an agent may target its OWN pane to restart itself. `prompt` queues a message typed into the resumed claude the moment it is ready (speak-first); requires resume:true.',
+        'Kill and respawn a pane\'s shell. With resume:true, the pane\'s live Claude conversation (per its session marker) is resumed in its own cwd after the respawn — an agent may target its OWN pane to restart itself. `prompt` queues a message typed into the resumed claude the moment it is ready (speak-first); requires resume:true. `env` is layered over the pane\'s spawn env; the app accepts only CLAUDE_CONFIG_DIR (a registered account dir), which moves the pane to another Claude account, e.g. off one that hit its usage limit (with resume:true the same conversation continues there).',
       inputSchema: {
         paneId: z.string(),
         resume: z.boolean().optional().describe('Resume the pane\'s Claude conversation after respawn'),
-        prompt: z.string().optional().describe('Message delivered to the resumed conversation once ready')
+        prompt: z.string().optional().describe('Message delivered to the resumed conversation once ready'),
+        env: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe('Env over the pane\'s spawn env; the app accepts only CLAUDE_CONFIG_DIR (a registered account dir)')
       }
     },
-    async ({ paneId, resume, prompt }) =>
-      run(async (c) => {
-        await c.command({
-          type: 'restartPane',
-          paneId,
-          ...(resume ? { resume: true } : {}),
-          ...(resume && prompt !== undefined ? { prompt } : {})
-        });
-        return { ok: true, paneId, action: 'restartPane', ...(resume ? { resume: true } : {}) };
-      })
+    async ({ paneId, resume, prompt, env }) => run((c) => restartPaneResult(c, { paneId, resume, prompt, env }))
   );
 
   // ---- queue_prompt / restart_app (claude-resume: speak-first + phoenix) ----
@@ -1775,4 +1770,20 @@ export async function whoamiResult(c: Pick<ControlClient, 'health' | 'state'>, s
 /** control_status `build`: /health's, else /state.app's; undefined on public builds / older apps. */
 export function pickBuild(health: { build?: string }, state: ControlState): string | undefined {
   return health.build ?? state.app?.build;
+}
+
+/** What `restart_pane` sends: restartPane, with `resume`, its `prompt` (only with resume) and the caller's `env`. */
+export async function restartPaneResult(
+  c: Pick<ControlClient, 'command'>,
+  args: { paneId: string; resume?: boolean | undefined; prompt?: string | undefined; env?: Record<string, string> | undefined }
+): Promise<{ ok: true; paneId: string; action: 'restartPane'; resume?: true }> {
+  const { paneId, resume, prompt, env } = args;
+  await c.command({
+    type: 'restartPane',
+    paneId,
+    ...(resume ? { resume: true } : {}),
+    ...(resume && prompt !== undefined ? { prompt } : {}),
+    ...(env !== undefined ? { env } : {})
+  });
+  return { ok: true, paneId, action: 'restartPane', ...(resume ? { resume: true as const } : {}) };
 }

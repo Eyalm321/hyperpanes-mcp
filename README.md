@@ -50,7 +50,7 @@ It works at two levels, and you can use either without the other:
 | `set_layout` | Set a tab's tiling layout (defaults to the first window's active tab). |
 | `focus_pane` | Focus a pane (and its tab/window). |
 | `close_pane` | Close a pane, terminating its shell. |
-| `restart_pane` | Kill and respawn a pane's shell. |
+| `restart_pane` | Kill and respawn a pane's shell; `resume` continues its Claude conversation, `env.CLAUDE_CONFIG_DIR` moves it to another registered account. |
 | `rename_pane` | Change a pane's label and (optionally) subtitle, live. |
 | `recolor_pane` | Change a pane's frame color, live (any CSS color). |
 | `rename_tab` | Change a tab's title, live. Address the tab by the `tabId` from `list_panes`. Maps 1:1 to the app's `renameTab` command; the app trims the title and rejects an empty or over-80-char one. |
